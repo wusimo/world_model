@@ -1,0 +1,27 @@
+{
+  "per_variant": {
+    "flow_only": {
+      "val_fm": 0.9517963975667953,
+      "val_fm_sem": 0.01690898522021425,
+      "val_sc": 0.039214372634887695,
+      "val_sc_sem": 0.005829542957379422,
+      "n_batches": 24
+    },
+    "flow_coupled": {
+      "val_fm": 0.986306793987751,
+      "val_fm_sem": 0.021192403482877254,
+      "val_sc": 0.022934554843232036,
+      "val_sc_sem": 0.00023994097154747974,
+      "n_batches": 24
+    }
+  },
+  "delta": {
+    "val_fm_delta": 0.03451039642095566,
+    "val_sc_delta": -0.01627981779165566,
+    "val_sc_pct_improvement": 41.51492602784128,
+    "criterion_met": true
+  },
+  "sample_steps": 24,
+  "val_set_size": 186,
+  "val_batches": 24
+}

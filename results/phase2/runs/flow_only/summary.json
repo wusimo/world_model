@@ -1,0 +1,17 @@
+{
+  "variant": "flow_only",
+  "best_val_fm": 0.9380448659261068,
+  "final": {
+    "epoch": 39,
+    "train_fm": 0.8519083971387884,
+    "train_sc": 0.0,
+    "train_ph": 0.0,
+    "train_total": 0.8519083971387884,
+    "val_fm": 0.9520740980903307,
+    "val_sc": null,
+    "val_ph": null,
+    "elapsed": 372.2272849082947
+  },
+  "epochs": 40,
+  "elapsed": 372.2280032634735
+}
