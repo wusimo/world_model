@@ -83,21 +83,24 @@ optical flow magnitude.
 
 | Metric | Value | Threshold | Rating |
 |---|---|---|---|
-| **Median Pearson r** | **0.474** | >0.5 green, 0.2–0.5 yellow, <0.2 red | **Yellow** |
-| Mean r | 0.469 | — | — |
-| Min r | 0.267 | — | — |
-| Max r | 0.696 | — | — |
-| Significant (p<0.05) | 27/30 clips (90%) | — | Strong |
+| **Median Pearson r** | **0.470** | >0.5 green, 0.2–0.5 yellow, <0.2 red | **Yellow** |
+| Mean r | 0.456 | — | — |
+| Std r | 0.158 | — | — |
+| Min r | 0.162 | — | — |
+| Max r | 0.765 | — | — |
+| Significant (p<0.05) | 22/30 clips (73%) | — | Strong |
 
 **Interpretation:** Token deltas carry a genuine motion-correlated signal.
-90% of clips show statistically significant correlation, and no clip falls
-below r = 0.2. However, the median r of 0.47 means tokens explain only ~22%
-of the variance in optical flow magnitude — the encoding is motion-aware but
-not dynamics-specialized.
+73% of clips show statistically significant correlation, and no clip falls
+below r = 0.16. The median r of 0.47 means tokens explain only ~22% of the
+variance in optical flow magnitude — the encoding is motion-aware but not
+dynamics-specialized.
 
 The strongest correlations (r > 0.6) appear on clips with clear, sustained
-object motion (droid_0008, droid_0011, droid_0021, droid_0022). Weaker
-correlations appear on clips with subtle/slow motion (droid_0006, droid_0012).
+object motion (droid_0008 r=0.765, droid_0021 r=0.742, droid_0019 r=0.653,
+droid_0022 r=0.647). Weakest correlations appear on clips with subtle/slow
+motion (droid_0012 r=0.162, droid_0006 r=0.214, droid_0020 r=0.217,
+droid_0017 r=0.219).
 
 ### Exp 4 — Cross-Domain Probe (Set A vs Set C)
 

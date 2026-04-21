@@ -55,6 +55,34 @@ Conclusion: **green-light scaling up to real Phase 2**. The coupling design is n
 
 - `results/phase2/plot_compare.png` — bar chart of val_fm and val_sc with ±sem.
 
+## Pixel-space feasibility addendum (2026-04-21)
+
+Token-space wins don't automatically imply pixel-space wins. We trained a tiny
+learned stand-in decoder (pooled tokens → 64×64 depth, 0.88 M params, L1 on
+unit-median-normalized cached depth, 80 epochs on 2,972 real train frames)
+and decoded samples from both variants (8 windows, seed=1337, 24-step Euler).
+
+| Metric | real | flow_only | flow_coupled |
+|---|---|---|---|
+| Temporal smoothness ↓ | 0.015 | 0.096 | **0.180** |
+| Wasserstein to real depth ↓ | — | 0.047 | **0.076** |
+
+**Both pixel metrics regress under coupling.** Qualitative strips
+(`results/phase2/pixel_eval/compare_grid.png`): real clips show coherent
+bright structure persisting across t=0..7; `flow_only` is rougher but
+globally structured; `flow_coupled` is high-frequency and less temporally
+coherent.
+
+**Interpretation.** `L_sc` pushes `G_θ` into a region of token space that the
+frozen predictor extrapolates easily but that a real-data-trained decoder
+treats as somewhat off-distribution. Token-level "easy to predict" ≠
+perceptually plausible at this prototype scale.
+
+**Caveats.** The decoder is a small learned stand-in, not VGGT's depth head
+(we did not cache full multi-layer aggregator outputs). Training set is 3K
+frames. The gap could close at real-scale data. Artifacts:
+`results/phase2/pixel_eval/{metrics.json, compare_grid.png, hist.png, strip_*.png, decoder.pt}`.
+
 ## Artifacts
 
 - Per-variant ckpts: `results/phase2/runs/{flow_only,flow_coupled}/best.pt`
@@ -62,6 +90,7 @@ Conclusion: **green-light scaling up to real Phase 2**. The coupling design is n
 - Stdout: `results/phase2/train_{flow_only,flow_coupled}.log`
 - Master runner log: `results/phase2/run_phase2.log`
 - Comparison JSON: `results/phase2/comparison.json`
+- Pixel-space eval: `results/phase2/pixel_eval/`
 
 ## Next steps for real Phase 2
 

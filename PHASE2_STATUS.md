@@ -72,3 +72,4 @@ Known gotchas:
 
 - **2026-04-20** — Scaffolding + training script written. Smoke OK (22.6M gen params, 6.2M physics, 717 train / 186 val windows). Config at `configs/phase2/default.yaml`.
 - **2026-04-20** — Both variants completed via `run_phase2.sh`. Post-hoc comparison (same 24-step sampler, same seed): `flow_coupled` cuts val_sc by **41.5%** (0.0392 → 0.0229) vs `flow_only`, at 3.6% cost to val_fm. Prototype success criterion met. See `PHASE2_REPORT.md`.
+- **2026-04-21** — Pixel-space feasibility eval (`scripts/phase2/pixel_eval.py`): trained a 0.88M-param token→depth decoder on the real Phase 1 cache (80 epochs, best val L1 0.166 on unit-median-normalized depth), decoded 8 windows per variant with a shared seed. Coupling *regresses* both pixel metrics — temporal smoothness 0.096 → 0.180, Wasserstein-to-real 0.047 → 0.076. Token-plausibility ≠ perceptual-plausibility at this scale. Artifacts in `results/phase2/pixel_eval/`.

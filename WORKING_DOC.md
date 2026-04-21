@@ -1,212 +1,463 @@
-# GeoPhys-WM Working Doc — What's Been Done, Architecture, Data
+# GeoPhys-WM Working Doc — Current Results, Architecture, Data
 
 **Scope.** High-level summary of work in `Simo/geophys-feasibility/`, the working
 repo for the GeoPhys-WM plan (unified generative + predictive world model on a
 frozen VGGT geometric latent, with a physics-coupling module).
 
-**Status snapshot (2026-04-20).** Phase 0 feasibility → cautious proceed.
-Phase 1 predictive head → trained, VGGT beats DINOv2 by ~7–8×. Phase 2 coupling
-prototype → −41.5% predictor self-consistency loss under coupling. Paper-scale
-Phase 2/3 not yet run.
+**Status snapshot.** Phase 0 feasibility → cautious proceed. Phase 1 predictive
+head → VGGT beats DINOv2 by ~7–8×. Phase 2 coupling prototype → −41.5%
+predictor self-consistency on held-out windows. Pixel-space feasibility eval →
+coupling improves token-plausibility but **degrades** perceptual plausibility
+(a meaningful negative finding for the current design).
 
 ---
 
-## 1. What's been done
+## 0. TL;DR for a coworker glancing at this
+
+- We treat **frozen VGGT-1B** as a 3D-aware image encoder. It emits per-frame
+  geometric "tokens" (scene structure + camera + depth).
+- On top of those tokens, we train two small heads in our shared latent:
+  a **predictor** `D_ψ` (action-conditioned next-state), and a **generator**
+  `G_θ` (flow-matching text-conditioned future synthesis).
+- A **physics module** `g_φ` and a **predictor self-consistency loss** couple
+  them: generated futures must look physically in-distribution AND be easy for
+  the frozen predictor to extrapolate.
+- **Phase 0**: VGGT tokens respond to scene motion (Pearson r=0.47 manipulation,
+  0.52 driving) — weak-to-moderate but above the pivot threshold. Depth drift
+  across sliding windows is 5.5% (yellow).
+- **Phase 1**: small transformer predictor on frozen VGGT tokens → trained in 7
+  minutes on 30 DROID clips; beats a DINOv2 baseline by ~7–8× on L2 at both
+  k=1 and k=8 horizons. Action conditioning unexpectedly *regressed* slightly.
+- **Phase 2**: flow-matching generator + coupling loss → **−41.5%** predictor
+  self-consistency loss on held-out windows vs. the uncoupled baseline, at a
+  3.6% cost to pure flow-matching.
+- **Pixel-space eval (new)**: token-level plausibility does not transfer to
+  pixel space on this prototype — coupled samples decode to *noisier*, less
+  temporally smooth depth than uncoupled ones. Suggests the coupling loss
+  optimizes a direction the decoder treats as adversarial.
+
+All prototype-scale (30 clips). Numbers establish that the mechanism is live,
+not final performance.
+
+---
+
+## 1. System architecture (single picture)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     FROZEN GEOMETRIC FOUNDATION MODEL                        │
+│                                                                              │
+│   images [T, 3, 518, 518]  ──►  VGGT-1B aggregator  ──►  tokens [T, 64, 2048]│
+│                                     (frozen)          (pooled 8×8 grid, bf16)│
+│                                                                              │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │   shared state space z
+        ┌──────────────────────────────┼──────────────────────────────┐
+        │                              │                              │
+        ▼                              ▼                              ▼
+┌───────────────────┐        ┌──────────────────┐           ┌──────────────────┐
+│  Predictor D_ψ    │        │  Generator G_θ   │           │ Physics g_φ      │
+│  (Phase 1)        │        │  (Phase 2)       │           │ (Phase 2)        │
+│                   │        │                  │           │                  │
+│  [z_{t-3..t}, a]  │        │ [text, z_0] → z  │           │ [z_{0..3}] → φ   │
+│       ↓           │        │  rectified flow  │           │   latent ∈ ℝ^64  │
+│  small xformer    │        │  matching ODE    │           │   (not GT-sup)   │
+│  ~20 M params     │        │  ~23 M params    │           │   ~6 M params    │
+│       ↓           │        │        ↓         │           │        ↓         │
+│   ẑ_{t+1}         │        │   z_gen [T,P,D]  │           │   g_φ(z_gen)  ≈  │
+│                   │        │                  │           │   g_φ(z_real)    │
+└────────┬──────────┘        └────────┬─────────┘           └────────┬─────────┘
+         │                            │                              │
+         └────────┐          ┌────────┘                              │
+                  ▼          ▼                                       │
+           Coupling: L_sc (predictor self-consistency on z_gen)  ←───┘
+                 + L_ph (physics moment-match on φ)
+```
+
+- **Frozen** = no gradient, no fine-tuning: VGGT-1B, CLIP text encoder (Phase 2),
+  and in Phase 2 the already-trained Phase 1 predictor.
+- **Trained** = `D_ψ` in Phase 1 only; `G_θ` and `g_φ` in Phase 2 only.
+- The `vggt_noact` ablation from Phase 1 is what Phase 2 uses as the frozen
+  self-consistency predictor (generated trajectories lack real actions).
+- State space is identical across heads so losses are directly comparable and
+  the coupling is meaningful.
+
+---
+
+## 2. What each phase produced
 
 ### Phase 0 — Feasibility diagnostic (frozen VGGT-1B only)
-Goal: verify H1, that frozen VGGT tokens are a viable state space for dynamic
-manipulation scenes. Four experiments on 1–2 H100, ~40 GPU-hours.
+Goal: verify that frozen VGGT tokens are a viable state space for dynamic
+manipulation scenes. 1–2 H100s, ~40 GPU-hours, 4 diagnostics.
 
 | Exp | Question | Result | Rating |
 |---|---|---|---|
-| 1 | Temporal coherence across sliding windows (depth / pose / Chamfer) | Depth rel-err 5.5%, rotation 0.08° | Depth **Yellow**, pose **Green** |
-| 2 | Static vs dynamic reconstruction quality | Smooth motion/quality profile; VGGT is affine-invariant so absolute AbsRel on ScanNet is not comparable | **Green** (no cliff) |
-| 3 ★ | Do token deltas correlate with optical flow? (critical gate) | Median Pearson r = 0.47 (manipulation), 0.52 (driving); 90% p < 0.05 | **Yellow** (above Red 0.2, below Green 0.5) |
-| 4 | Cross-domain probe (manipulation vs KITTI) | Driving shows higher variance, bimodal distribution; signal is domain-general | Mixed |
+| 1 | Sliding-window temporal coherence (depth / pose / Chamfer) | Depth rel-err 5.5%, rotation 0.08°, Chamfer 3.4×10⁻² | Depth **Yellow**, pose **Green** |
+| 2 | Static vs dynamic reconstruction quality | Smooth quality-vs-motion profile; raw ScanNet AbsRel uncalibrated (expected — VGGT is affine-invariant) | **Green** (no cliff) |
+| 3 ★ | Do token deltas correlate with RAFT optical flow? (critical gate) | Median Pearson r = 0.470 (manipulation, n=30), 0.522 (driving, n=11); **22/30 DROID clips p<0.05**; min r = 0.162 | **Yellow** manipulation / **Green** driving |
+| 4 | Cross-domain probe (manipulation vs KITTI) | Driving is bimodal (std 0.32 vs 0.16): highway uniform-motion scenes push to r≈0; curated scenes reach r=0.80 | Mixed |
 
-**Verdict:** Cautious proceed. Signal is present and significant; a world model
-on these tokens will likely need either (a) light VGGT fine-tuning, or (b) a
-dynamics head on top of the frozen backbone. Full write-up in `REPORT.md`.
+**Verdict (`REPORT.md`).** Cautious proceed. No metric crosses the red/pivot
+line; two land yellow. The honest reading is: tokens are motion-aware but not
+dynamics-specialized, so a world model on top of them must either (a) fine-tune
+VGGT's aggregator on a dynamics objective, or (b) keep VGGT frozen and let a
+downstream head absorb the dynamics residual. We chose (b) for Phase 1.
 
-### Phase 1 — Predictive head on frozen tokens (~7.5 min, 3 GPUs)
-Train a small transformer predictor `D_ψ` on pre-cached tokens; compare VGGT vs
-DINOv2 and ablate action conditioning.
+### Phase 1 — Predictive head `D_ψ` on frozen tokens
+30 epochs, batch 16, ~20 M-param transformer head, **~7.5 min wall-clock** on
+3 GPUs (one GPU per run). Same transformer across runs; only the input
+backbone/conditioning varies.
 
-| Run | Val loss | L2 k=1 | L2 k=8 | cos k=8 |
-|---|---|---|---|---|
-| `vggt` (action-cond) | 0.0189 | 1.73 | 3.83 | 0.9934 |
-| `vggt_noact` (zero-action) | **0.0171** | 1.54 | 3.34 | 0.9939 |
-| `dinov2` | 0.1228 | 13.87 | 24.11 | 0.8160 |
+| Run | Val loss | L2 k=1 | L2 k=8 | cos k=8 | \|Δcf\| k=1 |
+|---|---|---|---|---|---|
+| `vggt` (VGGT + actions) | 0.0189 | 1.73 | 3.83 | 0.9934 | 0.0431 |
+| `vggt_noact` (VGGT, actions zeroed) | **0.0171** | 1.54 | 3.34 | 0.9939 | 0.0000 |
+| `dinov2` (DINOv2 + actions) | 0.1228 | 13.87 | 24.11 | 0.8160 | 0.0283 |
 
-**Findings.** VGGT tokens dominate DINOv2 by ~7–8× on L2 at every horizon, and
-generalize cleanly (no DINOv2-style overfitting). Action conditioning *regressed*
-by ~9% — counterfactual action swaps shift predictions (cf_delta ≈ 0.04) but the
-signal hurts more than it helps at this scale. Full write-up in `PHASE1_REPORT.md`.
+`|Δcf|` = mean shift in the predicted next-token when the action is counterfactually swapped (0 by construction for `vggt_noact`).
 
-### Phase 2 — Coupling feasibility prototype (~22 min, 2 GPUs)
-Train a generative head `G_θ` (flow matching on VGGT tokens) with two variants,
-to test whether the coupling mechanism (predictor self-consistency + physics
-moment match) works as designed. **Not paper-scale Phase 2** — only 30 DROID clips.
+**Findings.**
+- **VGGT dominates DINOv2** at every horizon: L2 ~7–8× lower, cosine ~0.12
+  higher. DINOv2 overfits severely (train 0.007 vs val 0.123, 17× gap); VGGT
+  runs generalize cleanly (train ~0.012 vs val ~0.018).
+- **Action conditioning slightly hurts** on this dataset: `vggt_noact` wins by
+  ~9% on val loss and ~11% on L2 at every horizon. The action head *does* learn
+  (cf_delta ≈ 0.04 is clearly non-zero) but the signal adds more noise than
+  it adds conditioning. Suspect under-regularized action embedding, narrow
+  action variance in DROID at this scale, or FiLM-vs-additive routing choice.
+- **Rollouts degrade gracefully**: L2 doubles from k=1 to k=8 while cosine
+  drops only 0.004 — tokens stay nearly parallel even when their magnitude
+  drifts. Consistent with the Phase 0 temporal-coherence picture.
 
-| Variant | val_fm (flow-matching) | val_sc (predictor self-consistency) |
-|---|---|---|
-| `flow_only` | 0.9518 ± 0.0169 | 0.03921 ± 0.00583 |
-| `flow_coupled` | 0.9863 ± 0.0212 | **0.02293 ± 0.00024** (−41.5%) |
+Full write-up: `PHASE1_REPORT.md`. Training/rollout plots:
+`results/phase1/plot_train.png`, `results/phase1/plot_rollout.png`.
 
-Coupling cost 3.6% on flow matching, gained 41.5% on predictor self-consistency
-on held-out windows, with variance collapsing ~25×. Success criterion met →
-green-light scaling up. Physics moment-match loss ended near 10⁻⁶ (likely
-saturated on 30 clips — needs real Phase 2 data to test meaningfully). Full
-write-up in `PHASE2_REPORT.md`.
+### Phase 2 — Generator `G_θ` + coupling (feasibility prototype)
+40 epochs, batch 8, **22 min wall-clock** on 2 GPUs (coupled 16 min, flow_only
+6 min). 24 train / 6 val clips → 717 train / 186 val windows. **Not
+paper-scale** — purely "does the coupling mechanism work as designed?".
 
-### Not yet done
-- Paper-scale Phase 1: 50–200K manipulation episodes, full baselines, NeurIPS'26 numbers.
-- Paper-scale Phase 2: 10–50K (text, scene) pairs with physics coupling at realistic scale.
-- Phase 3: closed-loop self-improvement.
-- Pixel-space evaluation via VGGT decoder (all current eval is in token space).
-- Fine-tuning experiments (frozen VGGT throughout so far).
-
----
-
-## 2. Architecture
-
-### Backbone (frozen everywhere)
-**VGGT-1B** (`facebook/VGGT-1B`), wrapped in `src/vggt_wrapper.py`:
-- `encode(images)` → last-layer aggregated tokens, bf16 autocast.
-- `decode_geometry(...)` → depth, point maps, camera extrinsic/intrinsic (used
-  only for Phase 0 diagnostics; Phase 1/2 operate in token space).
-- Tokens are pooled from VGGT's 1374-token output per frame (4 specials + 37×37
-  patch grid) down to an **8×8 grid (64 patch tokens, D=2048)** via
-  adaptive-avg-pool, cached per clip as bf16 (bitcast to int16 for numpy).
-
-State representation used downstream:
-- **Mean-pooled per frame**: `z_t ∈ ℝ^2048` for Phase 1 predictor input.
-- **Full 8×8 grid**: `[T, 64, 2048]` for Phase 2 generator / physics module.
-
-### Phase 1 — Predictive head `D_ψ` (~20 M params)
-`src/phase1/heads.py`. Vanilla transformer encoder:
-- Input: 4 past per-frame tokens + 4 past action embeddings + a learnable query
-  slot conditioned on target action.
-- 4 layers, hidden 512, 8 heads, dropout 0.1, norm-first, GELU.
-- Output: predicted next-frame token (D=2048 for VGGT, 768 for DINOv2 baseline).
-- Loss: MSE on tokens. Trained 30 epochs, batch 16, lr 3e-4, AdamW, cosine warmup.
-- `vggt_noact` ablation zeroes the action path; same head elsewhere.
-
-### Phase 2 — Generator `G_θ` (~22.6 M params)
-`src/phase2/generative.py`. Rectified flow matching in VGGT token space:
-- Predicts velocity `v_θ(z_t, t, cond_text, init_frame)` at time `t ∈ [0,1]`.
-- Conditioning: frozen CLIP ViT-B/32 pooled text embedding (task string) +
-  linear-projected init-frame tokens (broadcast over the T=8 frames as a static
-  reference the generator has to deform).
-- 6 transformer encoder layers, hidden 512, 8 heads, sinusoidal time embedding.
-- Loss: `‖v_θ(z_t, t, c) − (z_1 − z_0)‖²` where `z_t = (1−t)z_0 + t z_1`, `z_0 ∼ 𝒩(0,I)`.
-- Sampler: Euler (24 steps at eval, 8 steps during training for coupling — gradients
-  flow through the sampler via `sample_with_grad`).
-
-### Phase 2 — Physics inference `g_φ` (~6.2 M params)
-`src/phase2/physics.py`. Treats physics as a **latent variable**, not a
-supervised target:
-- Transformer over the first 4 frames (4 × 64 tokens + CLS), hidden 384, 3 layers.
-- Outputs `φ ∈ ℝ^64` — a distributional summary, not parameter-by-parameter.
-- Consistency loss: first+second moment match between `φ(z_real)` and `φ(z_gen)`
-  on a batch.
-
-### Phase 2 — Coupling loss
-`src/phase2/coupling.py`. Two legs:
-1. **Predictor self-consistency** `L_sc`: sample future tokens from `G_θ`, feed
-   through the *frozen* Phase-1 `vggt_noact` predictor one step at a time,
-   require low step-wise MSE. Intuition: plausible rollouts should be easy to
-   extrapolate. Zero actions are used (`vggt_noact` predictor) since generated
-   trajectories have no real actions.
-2. **Physics distribution match** `L_ph`: `g_φ(z_gen)` should look like
-   `g_φ(z_real)` in moments.
-3. Total: `L_fm + 1.0·L_sc + 0.1·L_ph` in the `flow_coupled` variant.
-
-### What's frozen vs trained
-
-| Module | Phase 0 | Phase 1 | Phase 2 |
+| Variant | val_fm (flow-match) | val_sc (predictor self-consistency) | Δ vs baseline |
 |---|---|---|---|
-| VGGT-1B backbone | frozen | frozen (cached tokens) | frozen (cached tokens) |
-| CLIP text encoder | — | — | frozen |
-| Predictor `D_ψ` | — | **trained** | frozen (`vggt_noact/best.pt`) |
-| Generator `G_θ` | — | — | **trained** (both variants) |
-| Physics `g_φ` | — | — | **trained** (coupled variant only) |
+| `flow_only` | 0.9518 ± 0.0169 | 0.03921 ± 0.00583 | — |
+| `flow_coupled` | 0.9863 ± 0.0212 | **0.02293 ± 0.00024** | **−41.5% val_sc**, +3.6% val_fm |
 
----
+**Findings.**
+- Coupling does what it's designed to: generated rollouts become dramatically
+  easier for the frozen `D_ψ` to extrapolate.
+- Variance **collapses ~25×** (sem 0.00583 → 0.00024) — coupling doesn't just
+  lower the mean, it makes the generator uniformly predictor-plausible.
+- The physics moment-match loss ended near 10⁻⁶. On 30 clips `g_φ` plausibly
+  saturated to near-constant; essentially all lift came from `L_sc`. This
+  branch needs real-scale data to test.
+- Prototype success criterion met → green-light real Phase 2.
 
-## 3. Data
+Full write-up: `PHASE2_REPORT.md`. Comparison plot:
+`results/phase2/plot_compare.png`.
 
-Frozen against manifests under `data/manifests/`; raw frames live outside the
-repo. Total <50 GB.
+### Pixel-space feasibility eval (new, 2026-04-21)
+Question: do predictor-plausible samples also **look** plausible? All Phase 2
+metrics so far are in token space. Here we train a tiny learned decoder
+`pooled_tokens → 64×64 depth` on the real Phase 1 cache, then apply it to
+samples from both generator variants.
 
-### Sets used
+**Why not use VGGT's own decoder?** Its depth_head needs the *full multi-layer
+aggregator output* (1374 tokens per frame, all layers). We only cached the
+last layer pooled to 8×8. The honest-but-small substitute is to learn a
+token→depth mapping from real pairs and apply it to generated tokens.
 
-| Set | Role | Source | Size |
+| Metric | real | flow_only | flow_coupled |
 |---|---|---|---|
-| **A** — manipulation | Phase 0 Exp 1/3; Phase 1 & 2 training | `lerobot/droid_100` (HF), DROID end-effector deltas as actions (A=7: xyz+rxyz+gripper) | 30 clips × ≤128 frames |
-| **B** — static | Phase 0 Exp 2 (static baseline, GT depth) | ScanNet subset | 20 scenes × ~20 frames |
-| **C** — driving | Phase 0 Exp 4 (cross-domain probe) | KITTI subset | 11 drives × up to 30 frames |
+| Temporal smoothness (per-frame L1 across t) ↓ | 0.015 | 0.096 | **0.180** |
+| Wasserstein distance to real depth distribution ↓ | — | 0.047 | **0.076** |
+| p10 / p50 / p90 (normalized depth) | 0.73 / 1.00 / 1.36 | 0.78 / 1.00 / 1.26 | 0.84 / 1.00 / 1.37 |
 
-### Phase 1/2 token cache
-- One forward pass of VGGT-1B per clip → `.npz` shards in
-  `results/phase1/cache_tokens/` containing pooled tokens (8×8×2048 bf16),
-  downsampled depth (64×64 fp16), extrinsic (3×4), intrinsic (3×3), actions
-  (A=7), states (S=7), frame IDs.
-- Window config: W=8 frames, stride 4 (50% overlap), up to 128 frames/clip →
-  ~16 windows/clip.
-- Train/val split: `val_episode_ids = [3, 9, 14, 19, 24, 29]` (6/30 held out);
-  rest train. Same split shared across Phase 1 and Phase 2 so the frozen Phase 1
-  predictor is not evaluated on its own training data in Phase 2.
-- DINOv2 baseline: parallel cache using `vit_base_patch14_dinov2.lvd142m` at
-  image size 518 (to match VGGT's FOV), same 8×8 pool, D=768.
+**Finding (important).** `flow_coupled` is *worse* than `flow_only` in pixel
+space by both metrics, while being better in token space by a large margin.
+Looking at the side-by-side strips (`results/phase2/pixel_eval/compare_grid.png`):
 
-### Text conditioning (Phase 2)
-DROID task strings (free-text), fed through frozen CLIP ViT-B/32 text encoder
-(max length 32). Empty tasks fallback: `"robot manipulation task"`. This is
-deliberately shallow — real Phase 2 needs 10–50K richer (text, scene) pairs per
-the roadmap.
+- **Real** clips show a coherent bright region that persists across t=0..7.
+- **flow_only** produces rougher but still globally structured maps with
+  persistent large-scale structure.
+- **flow_coupled** produces high-frequency, less temporally coherent texture.
 
-### Physics supervision
-None. `φ` is a learned 64-dim latent, supervised only through the moment-match
-consistency loss and downstream predictor self-consistency. This keeps the
-project feasible — no dataset would provide `friction=0.3`-style labels.
+**Interpretation.** The self-consistency loss `L_sc` pushes `G_θ` into a region
+of token space that the frozen predictor extrapolates well but that the
+real-data-trained decoder treats as somewhat off-distribution. Token-level
+"easy to predict" ≠ "perceptually plausible" at this prototype scale. This is
+the exact "open question #5" flagged in the plan, now answered **negatively
+for the current design**.
+
+**Caveats.** (a) The decoder is a cheap 0.88 M-param stand-in, not VGGT's head;
+it may over-index on spatial structure the coupling loss inadvertently
+perturbs. (b) Training set is 3K frames; the decoder's OOD behavior on
+generated tokens is not well characterized. (c) The effect could disappear at
+paper-scale data where the coupling loss has room to find regions that are
+both predictor-plausible and in-distribution.
+
+Artifacts: `results/phase2/pixel_eval/{metrics.json, compare_grid.png, hist.png, strip_*.png, decoder.pt}`.
 
 ---
 
-## 4. Repo map
+## 3. Model details
+
+### Frozen backbone — VGGT-1B
+`src/vggt_wrapper.py`. `facebook/VGGT-1B`, bf16 autocast on Ampere+:
+- `encode(images)` → last-layer `aggregated_tokens` list + `ps_idx`. Images are
+  518×518, 3-channel, float ∈ [0,1].
+- `decode_geometry(tokens, ps_idx, images)` → depth, point_map, camera
+  extrinsic/intrinsic, confidences. Used only for Phase 0 diagnostics and the
+  one-time cache step; never at Phase 1/2 training time.
+- VGGT returns 1374 tokens per frame (camera token + register token + special
+  tokens + 37×37 patch grid). We split off the 4 leading specials and
+  **adaptive-avg-pool the 37×37 patch grid to 8×8 = 64 patches per frame**,
+  each with D=2048.
+- Pool rationale: VGGT-World and VGGT-DP both report that a spatial pool of
+  the patch grid preserves enough geometric information for downstream tasks,
+  while cutting memory ~22× and making the per-epoch training cost trivial.
+
+### Phase 1 predictor `D_ψ` (`src/phase1/heads.py`)
+Vanilla pre-norm GELU Transformer encoder:
+
+| Component | Value |
+|---|---|
+| Input | 4 past mean-pooled frame tokens (D=2048) + 4 past action embeddings (A=7) |
+| Token projection | Linear 2048 → 512 |
+| Action projection | Linear 7 → 64 → GELU → Linear 64 → 512, added to token at same time step |
+| Query slot | Learnable D=512, additively conditioned on the *target* action |
+| Positional | Learned over (context + 1) = 5 slots |
+| Backbone | 4 × TransformerEncoderLayer, d_model=512, nhead=8, FF=2048, dropout=0.1, norm_first=True |
+| Readout | LayerNorm on the query slot → Linear 512 → 2048 |
+| Params | ~20 M trainable |
+| Loss | MSE on next-frame mean-pooled token |
+| Optim | AdamW lr=3e-4, wd=0.01, grad clip 1.0, 200-step linear warmup + cosine decay, 30 epochs |
+
+Action conditioning is the only difference between `vggt` and `vggt_noact`:
+the latter skips the additive action path entirely (the query slot starts as
+the bare learnable parameter, no tgt-action term).
+
+### Phase 2 generator `G_θ` (`src/phase2/generative.py`)
+Rectified flow matching in VGGT token space. Predicts the velocity field of
+the ODE that transports a standard Gaussian into real tokens.
+
+| Component | Value |
+|---|---|
+| Latent | z ∈ ℝ^(T=8 × P=64 × D=2048) = 8 frames of 8×8 grid, D=2048 |
+| Input projection | Linear 2048 → 512 on every token |
+| Time embedding | Sinusoidal, added to every token (one value per sample) |
+| Text conditioning | Frozen CLIP ViT-B/32 pooled output (512-dim); projected and added to every token |
+| Init-frame conditioning | Linear 2048 → 512 on the 64 patches of the first frame, broadcast across T (acts as a "static reference" the generator deforms) |
+| Positional | Learned over T·P = 512 slots (frame × patch grid) |
+| Backbone | 6 × TransformerEncoderLayer, d_model=512, nhead=8, FF=2048, dropout=0.0, norm_first=True |
+| Output | LayerNorm → Linear 512 → 2048 → reshape to [B, T, P, D] |
+| Params | ~22.6 M trainable |
+| Loss | `‖v_θ(z_t, t, c) − (z_1 − z_0)‖²` with `z_t = (1−t)z_0 + t·z_1`, `z_0 ∼ 𝒩(0,I)` |
+| Sampler | Euler, 8 steps during training (gradients through the sampler via `sample_with_grad`), 24 steps at eval |
+| Optim | AdamW lr=2e-4, 40 epochs |
+
+### Phase 2 physics `g_φ` (`src/phase2/physics.py`)
+Latent-variable physics inference. `φ ∈ ℝ^64` is **not** a supervised target —
+no dataset provides "friction = 0.3" labels. Instead, `g_φ` is trained jointly
+with `G_θ` through a distributional matching loss:
+
+| Component | Value |
+|---|---|
+| Input | First 4 frames of a window, 4 × 64 tokens at D=2048 |
+| Input projection | Linear 2048 → 384 |
+| CLS slot | Learnable D=384 prepended |
+| Positional | Learned over 4·64 + 1 = 257 slots |
+| Backbone | 3 × TransformerEncoderLayer, d_model=384, nhead=6, FF=1536 |
+| Head | LayerNorm → Linear 384 → 64 |
+| Params | ~6.2 M trainable |
+| Loss | `L_ph = ‖mean(φ_real) − mean(φ_gen)‖² + ‖std(φ_real) − std(φ_gen)‖²` (first + second moments per batch) |
+
+This is a deliberately weak physics "inference" — more a latent summary than
+an explicit parameter readout. The plan is to swap for MMD or a richer
+structural match at paper scale.
+
+### Phase 2 coupling (`src/phase2/coupling.py`)
+Two losses composed on top of flow matching:
+
+1. **Predictor self-consistency `L_sc`** (weight 1.0). Generate a trajectory,
+   mean-pool to per-frame tokens, run the frozen `vggt_noact` predictor one
+   step at a time with zero actions, report MSE. Low when the trajectory looks
+   like a plausible evolution under `D_ψ`.
+2. **Physics moment match `L_ph`** (weight 0.1).
+
+Total: `L = L_fm + 1.0·L_sc + 0.1·L_ph` in the `flow_coupled` variant, `L_fm`
+alone in `flow_only`.
+
+Gradients flow through the 8-step Euler sampler that produces `z_gen`, so the
+coupling is actually able to shape what `G_θ` samples. This is the single most
+important implementation detail in Phase 2.
+
+### Pixel decoder `TokenDepthDecoder` (new, `src/phase2/pixel_decode.py`)
+Tiny learned stand-in for VGGT's depth head, for the pixel-space eval only:
+
+| Component | Value |
+|---|---|
+| Input | pooled tokens [P=64, D=2048] reshaped to [D=2048, 8, 8] |
+| Stem | 1×1 conv → 128 |
+| Upsample | 3 × (ConvTranspose 2× stride-2 + 3×3 conv + GELU), channels 128 → 128 → 64 → 32 |
+| Head | 1×1 conv to 1 channel + softplus (depth ≥ 0) |
+| Output | 64×64 depth map |
+| Params | ~0.88 M |
+| Target | unit-median-normalized cached VGGT depth (shape-only) |
+| Loss | L1 |
+| Optim | AdamW lr=3e-4, wd=1e-4, 80 epochs |
+
+---
+
+## 4. Data details
+
+All data frozen against JSON manifests under `data/manifests/`; raw frames live
+outside the repo (`.gitignore`). Total disk <50 GB.
+
+### Set A — manipulation (primary)
+- **Source**: `lerobot/droid_100` on Hugging Face (30 episodes, public).
+- **Selection**: third-person camera views; skip wrist-cam-only and
+  severe-motion-blur clips; no camera cuts.
+- **Size used**: 30 clips × up to 128 frames each = ~3,840 frames.
+- **Actions (A=7)**: DROID end-effector deltas (x, y, z, rx, ry, rz, gripper),
+  normalized to zero-mean unit-std using training-split statistics.
+- **States (S=7)**: same space as actions (position + gripper state).
+- **Task strings**: short natural-language instructions ("pick up the cup",
+  "close the drawer"). Empty strings get `"robot manipulation task"` as
+  placeholder. Used only in Phase 2 as frozen CLIP text conditioning.
+
+### Set B — static scenes (Phase 0 baseline only)
+- **Source**: ScanNet subset (20 scenes × ~20 frames; ScanNet requires a signed
+  TOS form).
+- **Role**: Exp 2 baseline with GT depth (uint16 mm). Used to demonstrate that
+  VGGT outputs are affine-invariant and that evaluation needs median-ratio or
+  affine alignment.
+
+### Set C — driving (Phase 0 cross-domain only)
+- **Source**: KITTI subset (11 drives from `2011_09_26_*`, forward-facing
+  camera, up to 30 frames each).
+- **Role**: Exp 4 cross-domain probe. Intentionally includes both highway
+  uniform-motion drives (which break token-flow correlation) and curated
+  dynamic-agent drives (which have the cleanest r signal in the whole study,
+  up to r = 0.80 on drive 0009).
+
+### Token cache (Phase 1/2 shared; `results/phase1/cache_tokens/`)
+Built once by `src/phase1/cache.py`. One `.npz` per clip:
+
+| Field | Shape | Dtype | Meaning |
+|---|---|---|---|
+| `tokens` | (n_frames, 64, 2048) | int16 (bitcast of bf16) | pooled VGGT tokens |
+| `depth` | (n_frames, 64, 64) | fp16 | downsampled VGGT-predicted depth |
+| `extrinsic` | (n_frames, 3, 4) | fp32 | camera extrinsic (VGGT-predicted) |
+| `intrinsic` | (n_frames, 3, 3) | fp32 | camera intrinsic (VGGT-predicted) |
+| `conf` | (n_frames,) | fp32 | mean per-frame VGGT confidence |
+| `actions` | (n_frames, 7) | fp32 | DROID end-effector delta |
+| `states` | (n_frames, 7) | fp32 | DROID end-effector state |
+| `frame_ids` | (n_frames,) | int32 | absolute frame index in the source clip |
+
+Plus a `.json` sidecar with episode_index, task, fps, and the window plan.
+Both Phase 1 and Phase 2 read this cache directly; neither re-runs VGGT. The
+bf16→int16 bitcast is numpy-friendly (numpy has no bf16) and **lossless**.
+
+Sliding-window config: W=8 frames, stride=4 (50% overlap). Up to 128 frames
+per clip → ~16 windows per clip → 717 train / 186 val windows at the episode
+split below.
+
+### Split
+| Split | Episodes | Phase 1 pairs | Phase 2 windows |
+|---|---|---|---|
+| Train | 24 (all except 3, 9, 14, 19, 24, 29) | ~2,900 (C=4) | 717 |
+| Val | 6 (episodes 3, 9, 14, 19, 24, 29) | ~700 | 186 |
+
+Same split across Phase 1 and Phase 2, so the frozen Phase 1 predictor is
+never evaluated on data it trained on during Phase 2.
+
+### DINOv2 parallel cache (`results/phase1/cache_tokens_dinov2/`)
+Identical pipeline with `vit_base_patch14_dinov2.lvd142m` at 518×518, pooled
+to 8×8, D=768. Used only for the Phase 1 baseline comparison.
+
+### What's *not* in the cache
+- Raw frames (outside repo; re-fetchable from DROID via HuggingFace).
+- Full multi-layer VGGT aggregator outputs (we only cached last-layer + pooled).
+  This is why the pixel-space eval uses a learned stand-in decoder instead of
+  VGGT's own depth head.
+- Ground-truth physical parameters — we don't have any; `g_φ` is latent-only.
+
+### Data availability for scaling up
+- Phase 1 paper-scale needs 50–200K episodes. Accessible via Open X-Embodiment
+  (public, CC-BY), DROID full (~76K trajectories, license-gated), BridgeData V2.
+- Phase 2 paper-scale needs 10–50K (text, scene) pairs. ScanNet + ARKitScenes
+  with captions + bootstrap from Marble/Cosmos API.
+- Phase 3 needs only self-generated data on top of Phase 2.
+
+---
+
+## 5. Repo map
 
 ```
 configs/{phase1,phase2}/default.yaml   # one-place config per phase
 data/manifests/set_{a,b,c}.json        # frozen clip lists
 src/vggt_wrapper.py                    # VGGT encode/decode
-src/data_loader.py, metrics.py, viz.py # Phase 0 primitives
+src/{data_loader,metrics,viz}.py       # Phase 0 primitives
 experiments/exp1..4.py                 # Phase 0 diagnostics
 src/phase1/{cache,dataset,heads,train,eval}.py
-src/phase2/{generative,physics,coupling,dataset,text_encoder}.py
-scripts/phase2/{train_generative,compare_eval}.py
+src/phase2/{generative,physics,coupling,dataset,text_encoder,pixel_decode}.py
+scripts/phase2/{train_generative,compare_eval,pixel_eval}.py
 run_phase1.sh, run_phase2.sh           # multi-GPU orchestration
-REPORT.md                              # Phase 0 synthesis
+REPORT.md                              # Phase 0 synthesis (numbers match the CSVs)
 PHASE1_{REPORT,STATUS}.md              # Phase 1 results + restart guide
 PHASE2_{REPORT,STATUS}.md              # Phase 2 results + restart guide
-PAPER.md                               # paper draft
-results/                               # all metrics, plots, ckpts (gitignored)
+PAPER.md                               # Phase 0 paper draft
+results/                               # metrics, plots, ckpts (gitignored)
+  └── phase2/pixel_eval/               # new: decoded-depth eval
 ```
 
-## 5. Headline numbers to keep in mind
+## 6. Headline numbers
 
-- Frozen VGGT token-flow Pearson r: **0.47** manipulation / **0.52** driving.
+- Phase 0 token-flow Pearson r: **0.470** manipulation (n=30, 22/30 p<0.05) /
+  **0.522** driving (n=11).
+- Phase 0 depth drift across a 4-frame overlap: **5.5%**.
 - Phase 1 VGGT vs DINOv2 next-token L2 at k=8: **3.83 vs 24.11** (~6.3×).
-- Phase 1 action conditioning: slight regression (flag for Phase 2 triage).
-- Phase 2 coupling gain on held-out predictor self-consistency: **−41.5%** at
-  3.6% flow-matching cost; val_sc variance −25×.
+- Phase 1 action conditioning: slight regression (~9% worse val loss). Flagged
+  for Phase 2 triage.
+- Phase 2 coupling lift on held-out predictor self-consistency: **−41.5%** at
+  3.6% flow-matching cost; val_sc sem shrinks ~25×.
+- Pixel-space temporal smoothness: real **0.015**, flow_only 0.096,
+  flow_coupled **0.180** (coupling *worsens* perceptual smoothness).
+- Pixel-space Wasserstein to real depth: flow_only **0.047**, flow_coupled 0.076.
 
-## 6. Open questions carried forward
+## 7. Open questions carried forward
 
-1. Why did action conditioning hurt in Phase 1? (embedding regularization /
-   dataset action variance / FiLM vs concat injection)
-2. How does the coupling behave with more data (the current physics loss
-   saturated at 10⁻⁶)?
-3. Should coupling be scheduled (turn on `L_sc` after `G_θ` converges)?
-4. Fine-tune VGGT aggregator layers, or keep fully frozen?
-5. Pixel-space eval via VGGT decoder — do predictor-plausible samples look
-   perceptually plausible?
+1. **Why did action conditioning regress in Phase 1?** Candidates: under-
+   regularized action embedding, narrow DROID action variance at 30 clips,
+   FiLM vs additive injection. Triage: larger action embedding + higher-
+   variance subset.
+2. **Does the physics loss become meaningful at scale?** Phase 2's `L_ph`
+   saturated at 10⁻⁶ — likely `g_φ` collapse on 30 clips.
+3. **How do we close the token-vs-pixel gap?** Options: (a) add a pixel-space
+   term directly in the coupling loss (perceptual loss on a small decoder);
+   (b) schedule-based coupling (turn on `L_sc` only after `G_θ` converges on
+   flow matching); (c) re-cache full multi-layer aggregator outputs on the
+   val set so we can run VGGT's own depth head on generated samples.
+4. **Fine-tune VGGT aggregator vs keep fully frozen?** The Phase 0 yellow on
+   depth drift is the strongest argument for at least light fine-tuning.
+5. **Is the predictor-side of coupling too dominant?** With `w_sc=1.0` and
+   `w_ph=0.1`, essentially all lift is from `L_sc`. Ablate `w_sc` down and
+   `w_ph` up at larger scale.
+
+## 8. Current next actions (prototype → paper scale)
+
+Recommended as a ~1-week, <500 GPU-hour bridge before committing to the full
+Phase 1 run:
+
+1. **Diagnose Phase 1 action conditioning** on existing cache (a few hours).
+2. **Re-run coupling on 500–2K clips** to see whether `L_ph` becomes load-
+   bearing and whether the pixel-space gap closes or widens.
+3. **Stronger pixel-space eval**: train the decoder longer and on more data;
+   also try reinstating VGGT's depth head by re-caching full multi-layer
+   aggregator outputs for the val set only.
+4. **Schedule-based coupling ablation**: `L_sc` off for first 20 epochs, on
+   after. Cheap, testable on current 30-clip data.
+
+If all four look positive, commit to full Phase 1 per the compute budget in
+the prior working session's estimate (~3.5–5K H100-hours, 2–3 months on
+4–8× H100).
