@@ -106,6 +106,13 @@ def main():
                     help="tiny run: 2 epochs, 3 batches, 4 sample steps")
     ap.add_argument("--train_sample_steps", type=int, default=8,
                     help="Euler steps when generating z_gen for coupling loss")
+    ap.add_argument("--w_sc", type=float, default=None,
+                    help="override predictor-self-consistency weight (post-warmup)")
+    ap.add_argument("--w_ph", type=float, default=None,
+                    help="override physics moment-match weight (post-warmup)")
+    ap.add_argument("--sc_warmup_epochs", type=int, default=0,
+                    help="epochs with w_sc and w_ph forced to 0 at the start "
+                         "(schedule-based coupling; 0 = always on)")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.cfg).read_text())
@@ -115,8 +122,16 @@ def main():
     var = cfg["variants"][args.variant]
     cfg["coupling"]["w_selfconsistency"] = var["w_selfconsistency"]
     cfg["coupling"]["w_physics"] = var["w_physics"]
+    if args.w_sc is not None:
+        cfg["coupling"]["w_selfconsistency"] = args.w_sc
+    if args.w_ph is not None:
+        cfg["coupling"]["w_physics"] = args.w_ph
     do_coupling = (cfg["coupling"]["w_selfconsistency"] > 0
                    or cfg["coupling"]["w_physics"] > 0)
+    # Schedule-based coupling: post-warmup weights; before warmup both are 0.
+    w_sc_post = cfg["coupling"]["w_selfconsistency"]
+    w_ph_post = cfg["coupling"]["w_physics"]
+    warmup = max(0, args.sc_warmup_epochs)
 
     device = torch.device(cfg["train"]["device"] if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.out or f"results/phase2/runs/{args.variant}")
@@ -176,6 +191,10 @@ def main():
         gen.train()
         if phys is not None:
             phys.train()
+        # epoch-level coupling weights (schedule-based coupling)
+        active = ep >= warmup
+        w_sc_ep = w_sc_post if active else 0.0
+        w_ph_ep = w_ph_post if active else 0.0
         ep_fm, ep_sc, ep_ph, ep_tot, n_batches = 0.0, 0.0, 0.0, 0.0, 0
         for bi, batch in enumerate(train_dl):
             if bi >= max_batches:
@@ -191,16 +210,14 @@ def main():
             total = fm
             sc_val = ph_val = torch.zeros((), device=device)
 
-            if do_coupling:
+            if do_coupling and active:
                 n_steps = 4 if args.smoke else args.train_sample_steps
                 z_gen = sample_with_grad(gen, cond, init, n_steps=n_steps)
                 phys_C = phys.cfg.context_len
                 sc_val = predictor_selfconsistency_loss(
                     predictor, z_gen, cfg["coupling"]["context_len"])
                 ph_val = physics_consistency_loss(phys, z[:, :phys_C], z_gen[:, :phys_C])
-                total = (fm
-                         + cfg["coupling"]["w_selfconsistency"] * sc_val
-                         + cfg["coupling"]["w_physics"] * ph_val)
+                total = fm + w_sc_ep * sc_val + w_ph_ep * ph_val
 
             opt.zero_grad(set_to_none=True)
             total.backward()

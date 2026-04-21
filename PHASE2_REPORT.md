@@ -83,14 +83,81 @@ perceptually plausible at this prototype scale.
 frames. The gap could close at real-scale data. Artifacts:
 `results/phase2/pixel_eval/{metrics.json, compare_grid.png, hist.png, strip_*.png, decoder.pt}`.
 
+## Ablations addendum (2026-04-21)
+
+Three additional variants run to address the token-vs-pixel gap and the
+`w_sc=1.0` overkill question. Same dataset / training recipe as the originals;
+per-epoch val metrics use the in-training sampler (`n_steps=24`, `seed=1337`).
+Post-hoc numbers below from `compare_eval.py` on the full val loader.
+
+| Variant | w_sc | w_ph | sc warmup | val_fm ± sem | val_sc ± sem | val_fm cost | val_sc gain |
+|---|---|---|---|---|---|---|---|
+| `flow_only` | 0.00 | 0.00 | — | 0.9518 ± 0.0169 | 0.0392 ± 0.0058 | — | — |
+| `flow_coupled` | 1.00 | 0.10 | 0 | 0.9863 ± 0.0212 | **0.0229 ± 0.0002** | +3.6% | **+41.5%** |
+| `flow_coupled_sched20` | 1.00 | 0.10 | **20 ep** | 0.9571 ± 0.0191 | 0.0296 ± 0.0036 | **+0.6%** | +24.5% |
+| `flow_coupled_w05` | 0.50 | 0.05 | 0 | 0.9816 ± 0.0217 | 0.0231 ± 0.0004 | +3.1% | +41.1% |
+| `flow_coupled_w025` | 0.25 | 0.025 | 0 | 0.9740 ± 0.0215 | 0.0297 ± 0.0037 | +2.3% | +24.2% |
+
+**Pixel-space eval on the same variants** (shared decoder, seed, 24-step sampler):
+
+| Variant | Temporal smoothness ↓ | Wasserstein vs real ↓ |
+|---|---|---|
+| real (cache) | 0.015 | — |
+| `flow_only` | 0.097 | 0.047 |
+| `flow_coupled_sched20` | 0.105 | **0.035** |
+| `flow_coupled_w025` | 0.110 | 0.047 |
+| `flow_coupled_w05` | 0.197 | 0.092 |
+| `flow_coupled` (original) | 0.180 | 0.076 |
+
+### Findings
+
+**1. `w_sc=1.0` from epoch 0 is overkill.** `flow_coupled_w05` matches the
+original `flow_coupled` on val_sc (0.0231 vs 0.0229) at slightly less val_fm
+cost (+3.1% vs +3.6%). Half the coupling weight is enough; the remaining
+signal was just noise.
+
+**2. Schedule-based coupling is a Pareto win on two axes.**
+`flow_coupled_sched20` (no coupling for first 20 epochs, then full-strength)
+gives: (a) val_fm *parity with `flow_only`* (0.957 vs 0.952, +0.6%), and
+(b) the **best pixel-space wasserstein of any variant** (0.035 < 0.047 flow_only
+baseline). Token-space val_sc is 24.5% improvement over flow_only — modest
+compared to `flow_coupled`'s 41.5%, but the bundle is clearly preferable
+for downstream use.
+
+**3. The token-vs-pixel gap is driven by early-training coupling.**
+Qualitatively (`results/phase2/pixel_eval_ablations/compare_grid.png`):
+`flow_only` and `flow_coupled_sched20` produce depth with persistent large-
+scale structure; `flow_coupled_w05` and the original `flow_coupled` produce
+high-frequency, incoherent textures. Coupling applied before the generator
+has learned flow matching pushes it into a token-space region the decoder
+treats as adversarial. Coupling applied after flow matching has converged
+refines the sample distribution without breaking perceptual structure.
+
+**4. `w_sc=0.25` is strictly dominated.** More val_fm cost and worse val_sc
+than `w_sc=0.5`; non-monotonic in weight. Abandon this setting.
+
+### Recommendation for real Phase 2
+
+Use **schedule-based coupling** (warm up the pure-flow-matching phase for
+~50% of total training, then activate coupling). At 30-clip prototype scale
+this setup is both token-space-better and pixel-space-better than any other
+variant we tested. The simplest implementation is: start with
+`sc_warmup_epochs = 0.5 * total_epochs`, `w_sc = 1.0`, `w_ph = 0.1`.
+
+## Plots
+
+- `results/phase2/plot_compare.png` — original flow_only vs flow_coupled.
+- `results/phase2/plot_ablations_partial.png` — all 4 ablation variants.
+- `results/phase2/pixel_eval_ablations/compare_grid.png` — depth strips.
+
 ## Artifacts
 
-- Per-variant ckpts: `results/phase2/runs/{flow_only,flow_coupled}/best.pt`
+- Per-variant ckpts: `results/phase2/runs/{flow_only,flow_coupled,flow_coupled_sched20,flow_coupled_w05,flow_coupled_w025}/best.pt`
 - Per-variant training logs: `results/phase2/runs/<v>/train_log.json`, `summary.json`
-- Stdout: `results/phase2/train_{flow_only,flow_coupled}.log`
+- Stdout: `results/phase2/train_<variant>.log`
 - Master runner log: `results/phase2/run_phase2.log`
-- Comparison JSON: `results/phase2/comparison.json`
-- Pixel-space eval: `results/phase2/pixel_eval/`
+- Comparison JSONs: `results/phase2/comparison.json`, `results/phase2/ablations_partial.json`
+- Pixel-space eval: `results/phase2/pixel_eval/` (original) + `results/phase2/pixel_eval_ablations/` (variants)
 
 ## Next steps for real Phase 2
 

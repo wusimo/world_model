@@ -190,18 +190,24 @@ def run_one(
     return {"run_name": run_name, "best_val": best_val, "elapsed": elapsed}
 
 
-def main(cfg_path: str, runs: list[str], device: str = "cuda") -> None:
+def main(cfg_path: str, runs: list[str], device: str = "cuda",
+         action_embed_dim: int | None = None) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s  %(message)s",
         datefmt="%H:%M:%S",
     )
     cfg = yaml.safe_load(open(cfg_path))
+    if action_embed_dim is not None:
+        cfg["head"]["action_embed_dim"] = int(action_embed_dim)
+        log.info("override head.action_embed_dim = %d", cfg["head"]["action_embed_dim"])
 
     results = []
     for run in runs:
         log.info("=== run: %s ===", run)
-        if run == "vggt":
+        # `vggt_bigact` is an action-conditioning triage variant: same cache as
+        # `vggt` but caller overrides --action_embed_dim (default 64 -> e.g. 256).
+        if run in ("vggt", "vggt_bigact"):
             cache = Path(cfg["cache"]["out_dir"])
             token_dim = cfg["cache"]["token_dim"]
             use_actions = True
@@ -230,5 +236,8 @@ if __name__ == "__main__":
     p.add_argument("--cfg", default="configs/phase1/default.yaml")
     p.add_argument("--runs", nargs="+", default=["vggt", "vggt_noact", "dinov2"])
     p.add_argument("--device", default="cuda")
+    p.add_argument("--action_embed_dim", type=int, default=None,
+                   help="override cfg.head.action_embed_dim (e.g. 256 for "
+                        "action-conditioning capacity triage)")
     args = p.parse_args()
-    main(args.cfg, args.runs, args.device)
+    main(args.cfg, args.runs, args.device, action_embed_dim=args.action_embed_dim)

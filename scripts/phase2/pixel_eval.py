@@ -234,48 +234,42 @@ def save_strip(depth: np.ndarray, path: Path, title: str) -> None:
 
 
 def save_compare_grid(
-    real: np.ndarray, flow_only: np.ndarray, flow_coupled: np.ndarray,
-    path: Path, max_samples: int = 4,
+    rows: list[tuple[str, np.ndarray]], path: Path, max_samples: int = 4,
 ) -> None:
-    """Stack [real / flow_only / flow_coupled] rows; each row has
-    max_samples columns (first frame of each sample window)."""
-    max_samples = min(max_samples, real.shape[0], flow_only.shape[0], flow_coupled.shape[0])
-    fig, axes = plt.subplots(3, max_samples, figsize=(2.2 * max_samples, 6.8))
+    """Stack arbitrary rows of (label, [B, T, H, W]); show first frame per sample."""
+    max_samples = min([max_samples] + [arr.shape[0] for _, arr in rows])
+    R = len(rows)
+    fig, axes = plt.subplots(R, max_samples, figsize=(2.2 * max_samples, 2.0 * R + 0.6))
     if max_samples == 1:
         axes = axes[:, None]
-    rows = [("real (cache)", real),
-            ("flow_only (gen)", flow_only),
-            ("flow_coupled (gen)", flow_coupled)]
+    if R == 1:
+        axes = axes[None, :]
     for r, (label, arr) in enumerate(rows):
         for c in range(max_samples):
             ax = axes[r, c]
-            img = arr[c, 0]  # first frame of sample c
+            img = arr[c, 0]
             vmin = np.percentile(arr[c], 2); vmax = np.percentile(arr[c], 98)
             ax.imshow(img, cmap="magma", vmin=vmin, vmax=vmax)
             ax.set_xticks([]); ax.set_yticks([])
             if c == 0:
-                ax.set_ylabel(label, fontsize=10)
+                ax.set_ylabel(label, fontsize=9)
             if r == 0:
                 ax.set_title(f"sample {c}", fontsize=10)
-    fig.suptitle("Decoded depth — row: source, col: sample (t=0)", fontsize=11)
+    fig.suptitle("Decoded depth — row: variant, col: sample (t=0)", fontsize=11)
     fig.tight_layout()
     fig.savefig(path, dpi=120, bbox_inches="tight")
     plt.close(fig)
 
 
-def save_hist(
-    real: np.ndarray, flow_only: np.ndarray, flow_coupled: np.ndarray,
-    path: Path,
-) -> None:
-    fig, ax = plt.subplots(1, 1, figsize=(6, 3.5))
+def save_hist(entries: list[tuple[str, np.ndarray]], path: Path) -> None:
+    fig, ax = plt.subplots(1, 1, figsize=(6.5, 3.5))
     bins = np.linspace(0, 3.0, 60)  # scale-normalized depth
-    ax.hist(real.flatten(), bins=bins, alpha=0.45, label="real (cache)", density=True)
-    ax.hist(flow_only.flatten(), bins=bins, alpha=0.45, label="flow_only", density=True)
-    ax.hist(flow_coupled.flatten(), bins=bins, alpha=0.45, label="flow_coupled", density=True)
+    for label, arr in entries:
+        ax.hist(arr.flatten(), bins=bins, alpha=0.4, label=label, density=True)
     ax.set_xlabel("depth / per-sequence median")
     ax.set_ylabel("density")
     ax.set_title("Scale-normalized decoded depth distribution")
-    ax.legend()
+    ax.legend(fontsize=9)
     fig.tight_layout()
     fig.savefig(path, dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -290,6 +284,12 @@ def main():
     ap.add_argument("--sample_steps", type=int, default=24)
     ap.add_argument("--out", default="results/phase2/pixel_eval")
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--variants", nargs="+",
+                    default=["flow_only=results/phase2/runs/flow_only/best.pt",
+                             "flow_coupled=results/phase2/runs/flow_coupled/best.pt"],
+                    help="name=ckpt_path pairs, space-separated")
+    ap.add_argument("--decoder_ckpt", default=None,
+                    help="if set, skip decoder training and load this decoder.pt")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.cfg).read_text())
@@ -306,8 +306,15 @@ def main():
     val_ds = FrameTokenDepth(val_sh)
     print(f"frames: train {len(train_ds)}  val {len(val_ds)}")
 
-    # --------------- train decoder
-    decoder = train_decoder(train_ds, val_ds, args.decoder_epochs, device, out_dir)
+    # --------------- train or load decoder
+    if args.decoder_ckpt is not None:
+        decoder = TokenDepthDecoder(DecoderConfig()).to(device)
+        decoder.load_state_dict(torch.load(args.decoder_ckpt,
+                                           map_location=device, weights_only=True))
+        decoder.eval()
+        print(f"[decoder] loaded from {args.decoder_ckpt}")
+    else:
+        decoder = train_decoder(train_ds, val_ds, args.decoder_epochs, device, out_dir)
 
     # --------------- collect generation inits from val set
     _, gen_val_ds = build_datasets(cfg)
@@ -322,12 +329,14 @@ def main():
 
     B, T, P, D = z_real.shape
 
-    # --------------- sample from both variants
-    variants = {
-        "flow_only": "results/phase2/runs/flow_only/best.pt",
-        "flow_coupled": "results/phase2/runs/flow_coupled/best.pt",
-    }
-    z_gen = {}
+    # --------------- sample from each variant
+    variants: dict[str, str] = {}
+    for spec in args.variants:
+        if "=" not in spec:
+            raise ValueError(f"--variants entry must be name=path: {spec}")
+        name, path = spec.split("=", 1)
+        variants[name] = path
+    z_gen: dict[str, torch.Tensor] = {}
     for name, path in variants.items():
         gen = load_generator(Path(path), cfg, device)
         z_gen[name] = sample_variant(gen, cond, init, n_steps=args.sample_steps,
@@ -339,64 +348,66 @@ def main():
     decoder.eval()
     with torch.no_grad():
         def decode_seq(z: torch.Tensor) -> torch.Tensor:
-            # z: [B, T, P, D] -> [B, T, H, W]
             flat = z.reshape(B * T, P, D)
             d = decoder(flat)
             return d.reshape(B, T, d.shape[-2], d.shape[-1])
 
         d_real = decode_seq(z_real)
-        d_flow = decode_seq(z_gen["flow_only"])
-        d_cpl = decode_seq(z_gen["flow_coupled"])
+        d_variants = {name: decode_seq(z) for name, z in z_gen.items()}
 
     # --------------- metrics on scale-normalized decoded depth
     d_real_n = scale_normalize(d_real)
-    d_flow_n = scale_normalize(d_flow)
-    d_cpl_n = scale_normalize(d_cpl)
+    d_var_n = {name: scale_normalize(d) for name, d in d_variants.items()}
+
+    decoder_val_l1 = None
+    dec_log = out_dir / "decoder_log.json"
+    if dec_log.exists():
+        decoder_val_l1 = float(json.loads(dec_log.read_text())[-1]["val_l1"])
 
     metrics = {
         "config": {
             "n_samples": args.n_samples, "sample_steps": args.sample_steps,
             "decoder_epochs": args.decoder_epochs, "seed": args.seed,
+            "variants": variants,
         },
-        "decoder_val_l1": float(json.loads((out_dir / "decoder_log.json").read_text())[-1]["val_l1"]),
+        "decoder_val_l1": decoder_val_l1,
         "temporal_smoothness": {
             "real": temporal_smoothness(d_real_n),
-            "flow_only": temporal_smoothness(d_flow_n),
-            "flow_coupled": temporal_smoothness(d_cpl_n),
+            **{name: temporal_smoothness(d) for name, d in d_var_n.items()},
         },
         "distribution": {
             "real": distribution_stats(d_real_n),
-            "flow_only": distribution_stats(d_flow_n),
-            "flow_coupled": distribution_stats(d_cpl_n),
+            **{name: distribution_stats(d) for name, d in d_var_n.items()},
         },
         "wasserstein_vs_real": {
-            "flow_only": wasserstein_1d(d_flow_n, d_real_n),
-            "flow_coupled": wasserstein_1d(d_cpl_n, d_real_n),
+            name: wasserstein_1d(d, d_real_n) for name, d in d_var_n.items()
         },
     }
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
     # --------------- visualizations
     real_np = d_real_n.cpu().numpy()
-    flow_np = d_flow_n.cpu().numpy()
-    cpl_np = d_cpl_n.cpu().numpy()
+    var_np = {name: d.cpu().numpy() for name, d in d_var_n.items()}
 
     save_strip(real_np[0], out_dir / "strip_real.png", "real (cache) — sample 0")
-    save_strip(flow_np[0], out_dir / "strip_flow_only.png", "flow_only — sample 0")
-    save_strip(cpl_np[0], out_dir / "strip_flow_coupled.png", "flow_coupled — sample 0")
-    save_compare_grid(real_np, flow_np, cpl_np, out_dir / "compare_grid.png")
-    save_hist(real_np, flow_np, cpl_np, out_dir / "hist.png")
+    for name, arr in var_np.items():
+        save_strip(arr[0], out_dir / f"strip_{name}.png", f"{name} — sample 0")
+
+    rows = [("real (cache)", real_np)] + [(name, arr) for name, arr in var_np.items()]
+    save_compare_grid(rows, out_dir / "compare_grid.png")
+    hist_entries = [("real (cache)", real_np)] + [(name, arr) for name, arr in var_np.items()]
+    save_hist(hist_entries, out_dir / "hist.png")
 
     print("\n=== pixel-space feasibility eval ===")
     ts = metrics["temporal_smoothness"]
     ws = metrics["wasserstein_vs_real"]
-    print(f"temporal smoothness (lower = smoother):")
+    print("temporal smoothness (lower = smoother):")
     print(f"  real         {ts['real']:.4f}")
-    print(f"  flow_only    {ts['flow_only']:.4f}")
-    print(f"  flow_coupled {ts['flow_coupled']:.4f}")
-    print(f"wasserstein vs real depth distribution (lower = closer):")
-    print(f"  flow_only    {ws['flow_only']:.4f}")
-    print(f"  flow_coupled {ws['flow_coupled']:.4f}")
+    for name in var_np:
+        print(f"  {name:<20s} {ts[name]:.4f}")
+    print("wasserstein vs real depth distribution (lower = closer):")
+    for name in var_np:
+        print(f"  {name:<20s} {ws[name]:.4f}")
     print(f"\nartifacts written to {out_dir}")
 
 

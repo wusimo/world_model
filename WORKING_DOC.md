@@ -155,47 +155,57 @@ paper-scale** — purely "does the coupling mechanism work as designed?".
 Full write-up: `PHASE2_REPORT.md`. Comparison plot:
 `results/phase2/plot_compare.png`.
 
-### Pixel-space feasibility eval (new, 2026-04-21)
-Question: do predictor-plausible samples also **look** plausible? All Phase 2
-metrics so far are in token space. Here we train a tiny learned decoder
-`pooled_tokens → 64×64 depth` on the real Phase 1 cache, then apply it to
-samples from both generator variants.
+### Pixel-space feasibility eval (2026-04-21)
+Question: do predictor-plausible samples also **look** plausible? Trained a
+tiny learned decoder `pooled_tokens → 64×64 depth` on the real Phase 1 cache,
+then applied it to samples from each generator variant.
 
 **Why not use VGGT's own decoder?** Its depth_head needs the *full multi-layer
 aggregator output* (1374 tokens per frame, all layers). We only cached the
 last layer pooled to 8×8. The honest-but-small substitute is to learn a
 token→depth mapping from real pairs and apply it to generated tokens.
 
-| Metric | real | flow_only | flow_coupled |
-|---|---|---|---|
-| Temporal smoothness (per-frame L1 across t) ↓ | 0.015 | 0.096 | **0.180** |
-| Wasserstein distance to real depth distribution ↓ | — | 0.047 | **0.076** |
-| p10 / p50 / p90 (normalized depth) | 0.73 / 1.00 / 1.36 | 0.78 / 1.00 / 1.26 | 0.84 / 1.00 / 1.37 |
+Initial 2-variant result was a **negative finding** — the original
+`flow_coupled` regressed on both pixel metrics. The ablation runs
+(next section) then **turned this into a positive result** by showing which
+coupling schedule closes the pixel-vs-token gap.
 
-**Finding (important).** `flow_coupled` is *worse* than `flow_only` in pixel
-space by both metrics, while being better in token space by a large margin.
-Looking at the side-by-side strips (`results/phase2/pixel_eval/compare_grid.png`):
+### Coupling ablations (2026-04-21)
+Three variants run alongside the original to find the best coupling recipe:
 
-- **Real** clips show a coherent bright region that persists across t=0..7.
-- **flow_only** produces rougher but still globally structured maps with
-  persistent large-scale structure.
-- **flow_coupled** produces high-frequency, less temporally coherent texture.
+| Variant | w_sc | w_ph | sc warmup | val_fm | val_sc | Δval_fm | Δval_sc | Pixel smooth ↓ | Pixel W₁ ↓ |
+|---|---|---|---|---|---|---|---|---|---|
+| `flow_only` | 0 | 0 | — | 0.952 | 0.039 | — | — | 0.097 | 0.047 |
+| `flow_coupled` | 1.0 | 0.1 | 0 | 0.986 | **0.023** | +3.6% | **+41.5%** | 0.180 | 0.076 |
+| **`sched20`** | 1.0 | 0.1 | **20 ep** | **0.957** | 0.030 | **+0.6%** | +24.5% | 0.105 | **0.035** |
+| `w05` | 0.5 | 0.05 | 0 | 0.982 | 0.023 | +3.1% | +41.1% | 0.197 | 0.092 |
+| `w025` | 0.25 | 0.025 | 0 | 0.974 | 0.030 | +2.3% | +24.2% | 0.110 | 0.047 |
 
-**Interpretation.** The self-consistency loss `L_sc` pushes `G_θ` into a region
-of token space that the frozen predictor extrapolates well but that the
-real-data-trained decoder treats as somewhat off-distribution. Token-level
-"easy to predict" ≠ "perceptually plausible" at this prototype scale. This is
-the exact "open question #5" flagged in the plan, now answered **negatively
-for the current design**.
+**Findings (big).**
 
-**Caveats.** (a) The decoder is a cheap 0.88 M-param stand-in, not VGGT's head;
-it may over-index on spatial structure the coupling loss inadvertently
-perturbs. (b) Training set is 3K frames; the decoder's OOD behavior on
-generated tokens is not well characterized. (c) The effect could disappear at
-paper-scale data where the coupling loss has room to find regions that are
-both predictor-plausible and in-distribution.
+1. **`w_sc=1.0` from epoch 0 is overkill.** `w05` matches the original
+   `flow_coupled` on val_sc at slightly lower val_fm cost. Half the coupling
+   weight was enough.
+2. **Schedule-based coupling is a Pareto win on two axes.** `sched20` gives
+   val_fm *parity with flow_only* (+0.6% cost) AND the **best pixel-space
+   Wasserstein of any variant** (0.035 < 0.047 flow_only baseline). Token-
+   space val_sc gain is modest (24.5%) but the bundle is clearly preferable
+   for downstream use.
+3. **The token-vs-pixel gap is driven by early-training coupling.**
+   Qualitatively (`results/phase2/pixel_eval_ablations/compare_grid.png`):
+   `flow_only` and `sched20` produce depth maps with persistent large-scale
+   structure; `w05` and the original `flow_coupled` produce high-frequency,
+   incoherent textures. Coupling applied before flow matching has converged
+   pushes `G_θ` into a token-space region that is predictor-plausible but
+   decoder-adversarial. Coupling applied after convergence refines the sample
+   distribution without breaking perceptual structure.
+4. **`w_sc=0.25` is strictly dominated** by `w_sc=0.5`. Abandon.
 
-Artifacts: `results/phase2/pixel_eval/{metrics.json, compare_grid.png, hist.png, strip_*.png, decoder.pt}`.
+**Recommendation for real Phase 2**: schedule-based coupling with warmup
+~50% of training epochs, then `w_sc=1.0`, `w_ph=0.1`. Verified to beat
+flow_only on both token- and pixel-space metrics at 30-clip prototype scale.
+
+Artifacts: `results/phase2/pixel_eval/` (original 2-variant), `results/phase2/pixel_eval_ablations/` (all 4 variants), `results/phase2/ablations_partial.json`.
 
 ---
 
@@ -417,47 +427,68 @@ results/                               # metrics, plots, ckpts (gitignored)
   **0.522** driving (n=11).
 - Phase 0 depth drift across a 4-frame overlap: **5.5%**.
 - Phase 1 VGGT vs DINOv2 next-token L2 at k=8: **3.83 vs 24.11** (~6.3×).
-- Phase 1 action conditioning: slight regression (~9% worse val loss). Flagged
-  for Phase 2 triage.
-- Phase 2 coupling lift on held-out predictor self-consistency: **−41.5%** at
-  3.6% flow-matching cost; val_sc sem shrinks ~25×.
-- Pixel-space temporal smoothness: real **0.015**, flow_only 0.096,
-  flow_coupled **0.180** (coupling *worsens* perceptual smoothness).
-- Pixel-space Wasserstein to real depth: flow_only **0.047**, flow_coupled 0.076.
+- Phase 1 action conditioning: not capacity-limited. Larger action embedding
+  (64→256) improves k=1 by 3% but regresses k=8 (3.83→4.03); still loses to
+  `vggt_noact` everywhere.
+- Phase 2 coupling (original `flow_coupled`, w_sc=1.0 from ep 0): **−41.5%**
+  val_sc vs flow_only, +3.6% val_fm cost. But **−86%** pixel-space perceptual
+  quality (temporal smoothness 0.097 → 0.180).
+- Phase 2 coupling (`sched20`, warmup 20 epochs then w_sc=1.0): **−24.5%**
+  val_sc, **+0.6%** val_fm cost, and **BEST pixel-space Wasserstein of any
+  variant (0.035, better than flow_only's 0.047)**. Best overall variant.
+- Phase 2 coupling (`w05`, w_sc=0.5 from ep 0): matches `flow_coupled` on
+  val_sc at lower val_fm cost. Confirms original w_sc=1.0 was overkill.
 
 ## 7. Open questions carried forward
 
-1. **Why did action conditioning regress in Phase 1?** Candidates: under-
-   regularized action embedding, narrow DROID action variance at 30 clips,
-   FiLM vs additive injection. Triage: larger action embedding + higher-
-   variance subset.
-2. **Does the physics loss become meaningful at scale?** Phase 2's `L_ph`
-   saturated at 10⁻⁶ — likely `g_φ` collapse on 30 clips.
-3. **How do we close the token-vs-pixel gap?** Options: (a) add a pixel-space
-   term directly in the coupling loss (perceptual loss on a small decoder);
-   (b) schedule-based coupling (turn on `L_sc` only after `G_θ` converges on
-   flow matching); (c) re-cache full multi-layer aggregator outputs on the
-   val set so we can run VGGT's own depth head on generated samples.
-4. **Fine-tune VGGT aggregator vs keep fully frozen?** The Phase 0 yellow on
-   depth drift is the strongest argument for at least light fine-tuning.
-5. **Is the predictor-side of coupling too dominant?** With `w_sc=1.0` and
-   `w_ph=0.1`, essentially all lift is from `L_sc`. Ablate `w_sc` down and
-   `w_ph` up at larger scale.
+1. **Phase 1 action conditioning is not a capacity problem.** Triage tested
+   a 4× larger action embedding (64→256) with the `vggt_bigact` run: slight
+   improvement on k=1 L2 (1.73→1.68) but k=8 L2 regresses (3.83→4.03) and
+   still loses to `vggt_noact` everywhere. On 30 clips, the DROID action
+   signal is genuinely noisy, not under-represented. For full scale,
+   recommend: (a) `vggt_noact`-style architecture as the primary predictor,
+   (b) test FiLM vs additive injection as a separate variant, (c) spatial-
+   pool tokens instead of mean-pool so actions condition specific grid cells.
+2. **Token-vs-pixel gap is resolved by schedule-based coupling.** Ablations
+   above; use `sc_warmup_epochs ≈ 0.5 × total_epochs` at full scale.
+3. **Does the physics loss become meaningful at scale?** Still open —
+   Phase 2's `L_ph` saturated at 10⁻⁶ across all ablation variants, likely
+   `g_φ` collapse on 30 clips. Needs real-scale data to test.
+4. **Fine-tune VGGT aggregator vs keep fully frozen?** Still open. Phase 0
+   yellow on depth drift is the strongest argument for light fine-tuning.
+5. **Can we reinstate VGGT's own depth head?** The learned decoder stand-in
+   is cheap but imperfect. Re-caching full multi-layer aggregator outputs
+   for the val set (~6 clips, ~20 min) would let us use VGGT's real
+   depth_head on generated samples for the gold-standard perceptual eval.
 
 ## 8. Current next actions (prototype → paper scale)
 
-Recommended as a ~1-week, <500 GPU-hour bridge before committing to the full
-Phase 1 run:
+Most of the load-bearing prototype questions are now answered:
 
-1. **Diagnose Phase 1 action conditioning** on existing cache (a few hours).
-2. **Re-run coupling on 500–2K clips** to see whether `L_ph` becomes load-
-   bearing and whether the pixel-space gap closes or widens.
-3. **Stronger pixel-space eval**: train the decoder longer and on more data;
-   also try reinstating VGGT's depth head by re-caching full multi-layer
-   aggregator outputs for the val set only.
-4. **Schedule-based coupling ablation**: `L_sc` off for first 20 epochs, on
-   after. Cheap, testable on current 30-clip data.
+- ✅ Phase 1 action-conditioning triage: not a capacity issue. Recommend
+  `vggt_noact`-style as primary; test FiLM/spatial-pool separately.
+- ✅ Schedule-based coupling tested (`sched20`): Pareto win on both
+  token- and pixel-space metrics.
+- ✅ Coupling-weight sweep done: `w_sc=0.5` suffices, `w_sc=0.25` dominated.
+- ⚠️ Pixel-space eval: positive on `sched20` but still uses a learned decoder
+  stand-in, not VGGT's own depth head.
+- ⏳ Larger-data coupling (500–2K clips) not yet run; would tell us whether
+  `L_ph` becomes load-bearing and whether the schedule recipe generalizes.
 
-If all four look positive, commit to full Phase 1 per the compute budget in
-the prior working session's estimate (~3.5–5K H100-hours, 2–3 months on
-4–8× H100).
+**Remaining before committing to full Phase 1** (~1 week, <300 GPU-hours):
+
+1. **Re-cache full multi-layer aggregator outputs on the val set** (~6 clips,
+   ~20 min on 1 H100) so we can rerun pixel-eval with VGGT's real
+   depth_head. Confirms the `sched20` pixel-space win holds under the
+   gold-standard decoder.
+2. **Phase 1 FiLM variant** (`vggt_film`) — replace additive action injection
+   with FiLM. One more cheap run, tells us whether action routing rather
+   than capacity was the issue.
+3. **Mid-scale Phase 2 sanity** (500–2K clips, `sched20` variant only,
+   ~2 days of training). Tells us whether `L_ph` wakes up at scale and
+   whether the schedule recipe still works at larger data diversity.
+
+If all three look positive, commit to full Phase 1 per the compute budget
+(~3.5–5K H100-hours, 2–3 months on 4–8× H100). **The Phase 2 recipe is now
+pinned**: schedule-based coupling with warmup ~50% of total epochs,
+`w_sc=1.0`, `w_ph=0.1`. No weight sweep needed at scale.

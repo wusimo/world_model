@@ -47,3 +47,29 @@
 1. Diagnose action-conditioning regression: try (a) larger action embedding, (b) FiLM vs concat injection, (c) higher-action-variance subset of clips.
 2. Scale the head (50–100 M params) to see whether VGGT's advantage grows or saturates.
 3. Longer horizons (k=16, 32) to find where VGGT's cosine collapses — currently still 0.99 at k=8.
+
+## Action-conditioning triage addendum (2026-04-21)
+
+Ran `vggt_bigact` — same architecture as `vggt` but `action_embed_dim=256`
+(vs 64). Goal: test whether the regression is a capacity issue.
+
+| Run | best val | L2 k=1 | L2 k=8 | cos k=8 | \|cf_delta\| k=1 |
+|---|---|---|---|---|---|
+| `vggt` (embed=64) | 0.0189 | 1.73 | 3.83 | 0.9934 | 0.0431 |
+| `vggt_noact` | **0.0171** | **1.54** | **3.34** | **0.9939** | 0.0000 |
+| `vggt_bigact` (embed=256) | 0.0182 | 1.68 | **4.03** | 0.9931 | 0.0455 |
+
+**Finding: the regression is not capacity-limited.** `vggt_bigact` improves
+marginally on best val loss and k=1 L2 (3–4%) and becomes slightly more
+action-sensitive (cf_delta 0.0431 → 0.0455), but **k=8 L2 regresses**
+(3.83 → 4.03) and it still loses to `vggt_noact` everywhere. More capacity
+on the action path lets the head fit one-step transitions a hair better
+while accumulating error faster over rollouts — consistent with the
+hypothesis that DROID actions at 30-clip scale are a noisy predictor of
+pooled-token change.
+
+**Recommendation for full Phase 1.** Proceed with `vggt_noact`-style as the
+primary predictor. Separately test two variants we haven't tried:
+(a) **FiLM injection** (multiplicative conditioning) instead of additive;
+(b) **spatial-pool tokens** instead of mean-pool, so actions condition
+specific grid cells rather than all cells uniformly.

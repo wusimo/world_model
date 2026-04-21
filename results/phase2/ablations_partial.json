@@ -1,0 +1,48 @@
+{
+  "per_variant": {
+    "flow_only": {
+      "val_fm": 0.9517963975667953,
+      "val_fm_sem": 0.01690898522021425,
+      "val_sc": 0.039214372634887695,
+      "val_sc_sem": 0.005829542957379422,
+      "n_batches": 24
+    },
+    "flow_coupled_sched20": {
+      "val_fm": 0.9570623338222504,
+      "val_fm_sem": 0.019062187989247747,
+      "val_sc": 0.0295903585307921,
+      "val_sc_sem": 0.0036071741553910727,
+      "n_batches": 24
+    },
+    "flow_coupled_w05": {
+      "val_fm": 0.9815851847330729,
+      "val_fm_sem": 0.021703079135215138,
+      "val_sc": 0.023109398083761334,
+      "val_sc_sem": 0.0003810203175270639,
+      "n_batches": 24
+    },
+    "flow_coupled_w025": {
+      "val_fm": 0.9739816710352898,
+      "val_fm_sem": 0.02151357522266183,
+      "val_sc": 0.02971641191591819,
+      "val_sc_sem": 0.003665019863288614,
+      "n_batches": 24
+    }
+  },
+  "vs_flow_only_pct": {
+    "flow_coupled_sched20": {
+      "val_fm_cost_pct": 0.5532628899328718,
+      "val_sc_improvement_pct": 24.54205807065096
+    },
+    "flow_coupled_w05": {
+      "val_fm_cost_pct": 3.1297436345031984,
+      "val_sc_improvement_pct": 41.06906082898369
+    },
+    "flow_coupled_w025": {
+      "val_fm_cost_pct": 2.3308843703558453,
+      "val_sc_improvement_pct": 24.22061117081213
+    }
+  },
+  "sample_steps": 24,
+  "val_set_size": 186
+}

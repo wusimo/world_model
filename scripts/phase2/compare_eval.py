@@ -56,6 +56,15 @@ def eval_one(gen, predictor, val_dl, text_enc, cfg, device, n_steps):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--variants", nargs="+",
+                    default=["flow_only", "flow_coupled"],
+                    help="variant names under results/phase2/runs/")
+    ap.add_argument("--out_json", default="results/phase2/comparison.json")
+    ap.add_argument("--out_plot", default="results/phase2/plot_compare.png")
+    args = ap.parse_args()
+
     cfg = yaml.safe_load(Path("configs/phase2/default.yaml").read_text())
     torch.manual_seed(cfg["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -68,47 +77,57 @@ def main():
     predictor = load_predictor(cfg, device)
 
     results = {}
-    for variant in ["flow_only", "flow_coupled"]:
+    for variant in args.variants:
         ckpt = f"results/phase2/runs/{variant}/best.pt"
+        if not Path(ckpt).exists():
+            print(f"[warn] missing {ckpt}, skipping"); continue
         gen = load_gen(ckpt, device)
         torch.manual_seed(cfg["seed"])  # same noise across variants
         results[variant] = eval_one(gen, predictor, val_dl, text_enc, cfg, device,
                                     n_steps=cfg["eval"]["sample_steps"])
         print(f"{variant}: {results[variant]}")
+        del gen
+        torch.cuda.empty_cache()
 
-    # Delta: lower is better for both val_fm and val_sc.
-    delta = {
-        "val_fm_delta": results["flow_coupled"]["val_fm"] - results["flow_only"]["val_fm"],
-        "val_sc_delta": results["flow_coupled"]["val_sc"] - results["flow_only"]["val_sc"],
-        "val_sc_pct_improvement": 100.0 * (results["flow_only"]["val_sc"]
-                                           - results["flow_coupled"]["val_sc"])
-                                   / max(1e-12, results["flow_only"]["val_sc"]),
-        "criterion_met": results["flow_coupled"]["val_sc"] < results["flow_only"]["val_sc"],
-    }
-    out = {"per_variant": results, "delta": delta,
-           "sample_steps": cfg["eval"]["sample_steps"],
-           "val_set_size": len(val_ds), "val_batches": results["flow_only"]["n_batches"]}
-    Path("results/phase2/comparison.json").write_text(json.dumps(out, indent=2))
-    print(json.dumps(out["delta"], indent=2))
+    if "flow_only" in results:
+        base = results["flow_only"]
+        deltas = {}
+        for v, r in results.items():
+            if v == "flow_only":
+                continue
+            pct_fm = 100.0 * (r["val_fm"] - base["val_fm"]) / max(1e-12, base["val_fm"])
+            pct_sc = 100.0 * (base["val_sc"] - r["val_sc"]) / max(1e-12, base["val_sc"])
+            deltas[v] = {"val_fm_cost_pct": pct_fm, "val_sc_improvement_pct": pct_sc}
+        out = {"per_variant": results, "vs_flow_only_pct": deltas,
+               "sample_steps": cfg["eval"]["sample_steps"],
+               "val_set_size": len(val_ds)}
+    else:
+        out = {"per_variant": results, "sample_steps": cfg["eval"]["sample_steps"],
+               "val_set_size": len(val_ds)}
+    Path(args.out_json).write_text(json.dumps(out, indent=2))
+    print(json.dumps(out.get("vs_flow_only_pct", {}), indent=2))
 
     # plot
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    variants = ["flow_only", "flow_coupled"]
+    variants = list(results.keys())
     metrics = ["val_fm", "val_sc"]
-    titles = ["val flow-matching loss", "val predictor self-consistency"]
+    titles = ["val flow-matching loss (lower = better sampler)",
+              "val predictor self-consistency (lower = more predictable)"]
+    fig, axes = plt.subplots(1, 2, figsize=(max(8, 2.5 * len(variants)), 4))
+    colors = plt.cm.tab10.colors
     for i, (m, ti) in enumerate(zip(metrics, titles)):
         means = [results[v][m] for v in variants]
         sems = [results[v][m + "_sem"] for v in variants]
         axes[i].bar(variants, means, yerr=sems, capsize=6,
-                    color=["C0", "C1"])
-        axes[i].set_title(ti)
+                    color=[colors[k % len(colors)] for k in range(len(variants))])
+        axes[i].set_title(ti, fontsize=10)
         axes[i].set_ylabel(m)
-        for j, (mu, se) in enumerate(zip(means, sems)):
-            axes[i].text(j, mu, f"{mu:.4f}", ha="center", va="bottom")
+        axes[i].tick_params(axis="x", rotation=25, labelsize=9)
+        for j, mu in enumerate(means):
+            axes[i].text(j, mu, f"{mu:.4f}", ha="center", va="bottom", fontsize=8)
     plt.tight_layout()
-    plt.savefig("results/phase2/plot_compare.png", dpi=120)
+    plt.savefig(args.out_plot, dpi=120)
     plt.close()
-    print("wrote results/phase2/comparison.json and plot_compare.png")
+    print(f"wrote {args.out_json} and {args.out_plot}")
 
 
 if __name__ == "__main__":
