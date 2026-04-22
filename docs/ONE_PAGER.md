@@ -158,6 +158,8 @@ Phase 2 is explicitly medium-scale. If Phase 2 succeeds and we want to close the
 
 The gap is real but tractable — 10–20× scale is roughly the "second paper" delta, not the "different project" delta.
 
+**Middle ground** (~50 H100s, 6–8 wk): see [`STRETCH_PLAN.md`](STRETCH_PLAN.md) for the detailed recipe. Shorthand: 2.6 B trainable params, 400 K clips, 25 K H100-hours, new token→RGB decoder — medium-scale tier alongside GAIA-3 and Dreamer V3.
+
 ---
 
 ## 7. Answers to the three questions that prompted this doc

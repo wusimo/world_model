@@ -12,7 +12,7 @@ You are picking up a research project mid-flight. The feasibility study is compl
 
 Read these before doing anything else. Budget ~30 minutes.
 
-1. **`EXPERIMENTS_EXPLAINED.md`** — plain-language project overview. 10 min. Start here even if you have ML background; it sets the vocabulary everyone else in the repo uses.
+1. **`docs/EXPERIMENTS_EXPLAINED.md`** — plain-language project overview. 10 min. Start here even if you have ML background; it sets the vocabulary everyone else in the repo uses.
 2. **`PHASE2_PAPER_PLAN.md`** — the concrete plan you're executing. 10 min.
 3. **`PHASE2_REPORT.md`** — the feasibility-prototype writeup, including the pixel-space and ablation addenda. 5 min. Pay attention to the "Limitations" and "Findings" sections — they explain what's known, what's not, and what paper-scale should do differently.
 4. **`PHASE1_REPORT.md`** — predictor-head writeup, including the 2026-04-21 action-conditioning triage addendum. 5 min. The surprise finding that actions regressed is a load-bearing part of the paper narrative.
