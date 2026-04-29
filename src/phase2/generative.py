@@ -34,6 +34,7 @@ class GenerativeConfig:
     n_layers: int = 8
     n_heads: int = 12
     dropout: float = 0.0
+    use_checkpoint: bool = False    # activation checkpointing on backbone
 
 
 class TimeEmbed(nn.Module):
@@ -96,7 +97,15 @@ class FlowMatchingGenerator(nn.Module):
         # "static reference" that the generator has to deform).
         x = x + init_tok.repeat(1, T, 1)
         x = x + self.pos[:, : x.size(1)]
-        h = self.backbone(x)
+        if self.cfg.use_checkpoint and self.training:
+            from torch.utils.checkpoint import checkpoint
+            h = x
+            for layer in self.backbone.layers:
+                h = checkpoint(layer, h, use_reentrant=False)
+            if self.backbone.norm is not None:
+                h = self.backbone.norm(h)
+        else:
+            h = self.backbone(x)
         h = self.norm(h)
         v = self.out_proj(h).reshape(B, T, P, D)
         return v

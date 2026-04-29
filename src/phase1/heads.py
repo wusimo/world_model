@@ -43,10 +43,12 @@ class PredictiveHead(nn.Module):
         action_embed_dim: int = 64,
         dropout: float = 0.1,
         use_actions: bool = True,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         self.C = context_len
         self.use_actions = use_actions
+        self.use_checkpoint = use_checkpoint
         self.token_proj = nn.Linear(token_dim, hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, token_dim)
         self.query = nn.Parameter(torch.zeros(1, 1, hidden_dim))
@@ -70,6 +72,16 @@ class PredictiveHead(nn.Module):
         self.backbone = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.norm = nn.LayerNorm(hidden_dim)
 
+    def _run_backbone(self, h: torch.Tensor) -> torch.Tensor:
+        if not (self.use_checkpoint and self.training):
+            return self.backbone(h)
+        from torch.utils.checkpoint import checkpoint
+        for layer in self.backbone.layers:
+            h = checkpoint(layer, h, use_reentrant=False)
+        if self.backbone.norm is not None:
+            h = self.backbone.norm(h)
+        return h
+
     def forward(
         self,
         ctx_tokens: torch.Tensor,      # [B, C, D_in]
@@ -85,7 +97,7 @@ class PredictiveHead(nn.Module):
             q = self.query.expand(B, -1, -1)
         h = torch.cat([x, q], dim=1)                            # [B, C+1, H]
         h = h + self.pos[:, : h.size(1)]
-        h = self.backbone(h)
+        h = self._run_backbone(h)
         h = self.norm(h[:, -1])                                 # [B, H]
         return self.out_proj(h)                                 # [B, D_in]
 
