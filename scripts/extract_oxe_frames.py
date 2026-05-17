@@ -50,24 +50,37 @@ def _is_pil_image(x) -> bool:
         return False
 
 
+def _is_image_data(x) -> bool:
+    """True if x looks like a single image: PIL Image, encoded bytes (PNG/JPG/...),
+    or a numpy uint8 HxWxC array."""
+    if _is_pil_image(x):
+        return True
+    if isinstance(x, (bytes, bytearray)) and len(x) >= 64:
+        return True
+    try:
+        import numpy as _np
+        if isinstance(x, _np.ndarray) and x.dtype == _np.uint8 and x.ndim == 3 and x.shape[-1] in (1, 3, 4):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _find_image_seq(node):
     """Walk a nested dict/list looking for a sequence of images. Returns list or None.
 
-    OXE records typically nest like:
-        steps -> list of step dicts
-        each step has 'observation' -> {'image': PILImage, 'image_2': PILImage, ...}
-    or sometimes:
-        observations -> {'image': [PILImage, PILImage, ...]}
+    Handles OXE RLDS schema where each episode is `{steps: [{observation: {image: <bytes|array>}}, ...]}`
+    and also flatter layouts where images are stored as a top-level list of PIL images.
     """
-    # Direct: a list of PIL images
+    # Direct: a list of single images (PIL / bytes / ndarray)
     if isinstance(node, list):
-        if node and _is_pil_image(node[0]):
+        if node and _is_image_data(node[0]):
             return node
         # list of dicts: try to extract one image per element
         if node and isinstance(node[0], dict):
             for key in ("image", "rgb_static", "rgb", "front_camera_rgb",
                         "observation.images.exterior_image_1_left", "image_0"):
-                if key in node[0] and _is_pil_image(node[0][key]):
+                if key in node[0] and _is_image_data(node[0][key]):
                     return [el[key] for el in node if isinstance(el, dict) and key in el]
             # Nested observation
             for key in ("observation", "obs"):
@@ -84,9 +97,13 @@ def _find_image_seq(node):
     elif isinstance(node, dict):
         for key in ("image", "rgb_static", "rgb", "front_camera_rgb", "image_0"):
             v = node.get(key)
-            if isinstance(v, list) and v and _is_pil_image(v[0]):
+            if isinstance(v, list) and v and _is_image_data(v[0]):
                 return v
-        for v in node.values():
+        # Recurse, but skip the "image_list" key (in some datasets it's empty noise)
+        # and skip raw pickle bytes / scalar bytes blobs.
+        for k, v in node.items():
+            if isinstance(v, (bytes, bytearray)):
+                continue
             seq = _find_image_seq(v)
             if seq:
                 return seq
@@ -133,15 +150,24 @@ def extract_tar(
     jpg_quality: int = 90,
 ) -> tuple[int, int]:
     """Extract all episodes from one tar. Returns (n_episodes_written, n_frames_written)."""
+    import pickle
     import webdataset as wds
     from PIL import Image as PILImage
 
     n_eps = 0
     n_frames_total = 0
-    ds = wds.WebDataset(str(tar_path)).decode()
+    ds = wds.WebDataset(str(tar_path), shardshuffle=False).decode()
 
     for rec_idx, rec in enumerate(ds):
         # rec keys: __key__, __url__, ... and dataset-specific top-level keys.
+        # jxu124/OpenX-Embodiment stores each episode as a single pickled dict under
+        # "data.pickle" (the RLDS `{steps: [{observation: {image: bytes, ...}, ...}], ...}` schema).
+        if "data.pickle" in rec and isinstance(rec["data.pickle"], (bytes, bytearray)):
+            try:
+                rec = pickle.loads(rec["data.pickle"])
+            except Exception as e:
+                log.warning("pickle decode failed %s.%d: %s", tar_path.name, rec_idx, e)
+                continue
         ep_idx = episode_offset + rec_idx
         ep_dir = out_dir / dataset / f"episode_{ep_idx:06d}"
         meta_path = ep_dir / "meta.json"
