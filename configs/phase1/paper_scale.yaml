@@ -6,8 +6,11 @@ seed: 1337
 
 cache:
   manifest: data/manifests/paper_scale.json
+  # OXE clips don't have DROID parquet actions. Fill action/state with zeros
+  # (see SESSION_RECAP_2026-04-29). Real per-step OXE actions can be added later.
+  use_actions: false
   droid_parquet: data/raw/droid_100/data/chunk-000/file-000.parquet
-  out_dir: results/phase1_scale/cache_tokens          # 750 GB int16 / 375 GB int8
+  out_dir: /root/autodl-tmp/cache/paper_scale         # ~150 GB int16 for subset
   window: 8
   stride: 4
   max_frames_per_clip: 128

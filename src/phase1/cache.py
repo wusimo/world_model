@@ -82,6 +82,22 @@ def pool_tokens(tokens: torch.Tensor, grid: int, n_specials: int = 4) -> torch.T
 
 
 # -------------------------------------------------------- DROID action lookup
+class NullActions:
+    """Returns zero action/state arrays. Used when the manifest is not DROID-derived
+    (e.g. OXE clips) and we run with `use_actions: false`."""
+
+    def __init__(self, action_dim: int = 7, state_dim: int = 7) -> None:
+        self.action_dim = int(action_dim)
+        self.state_dim = int(state_dim)
+
+    def __call__(self, episode_index: int, frame_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        n = len(frame_ids)
+        return (
+            np.zeros((n, self.action_dim), dtype=np.float32),
+            np.zeros((n, self.state_dim), dtype=np.float32),
+        )
+
+
 @dataclass
 class DroidActions:
     """Lazy loader for per-episode action/state arrays from the LeRobot parquet."""
@@ -259,7 +275,13 @@ def run(cfg_path: str, limit: int | None = None, force: bool = False) -> None:
     out_dir = Path(cfg["cache"]["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    actions = DroidActions(cfg["cache"]["droid_parquet"])
+    if cfg["cache"].get("use_actions", True):
+        actions = DroidActions(cfg["cache"]["droid_parquet"])
+    else:
+        actions = NullActions(
+            action_dim=int(cfg["dataset"].get("action_dim", 7)),
+            state_dim=int(cfg["dataset"].get("state_dim", 7)),
+        )
 
     cacher = VGGTCachier(cfg)
     clips = manifest if limit is None else manifest[:limit]
