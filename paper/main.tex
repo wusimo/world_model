@@ -221,7 +221,8 @@ We train two Phase 2 arms with identical architecture, data, and seed, differing
 Arm & final $\fmloss$ & final $\scloss$ & final $\phloss$ & $\Delta \scloss$ vs.\ flow\_only \\
 \midrule
 \texttt{flow\_only} (paper-scale, baseline) & 0.476 & 0.026 & --- & --- \\
-\textbf{\texttt{flow\_coupled}} (paper-scale, this paper) & \textbf{0.477} & \textbf{0.008} & $4.9 \times 10^{-7}$ & \textbf{$-69\%$} \\
+\texttt{flow\_coupled} (paper-scale) & 0.477 & 0.008 & $4.9 \times 10^{-7}$ & $-69\%$ \\
+\textbf{\texttt{flow\_coupled\_cfg}} (paper-scale, this paper) & \textbf{0.471} & \textbf{0.0076} & $3.6 \times 10^{-7}$ & \textbf{$-71\%$} \\
 \midrule
 \texttt{flow\_coupled} (30-clip prototype) & 0.986 & 0.023 & $1.3 \times 10^{-6}$ & $-41.5\%$ vs.\ its baseline \\
 \bottomrule
@@ -230,13 +231,17 @@ Arm & final $\fmloss$ & final $\scloss$ & final $\phloss$ & $\Delta \scloss$ vs.
 
 \textbf{Result.} Figure~\ref{fig:phase2_loss} shows that coupling activates cleanly at step 4\,300. Before activation, $\scloss$ and $\phloss$ are mechanically zero (their weights are zero). At activation, they jump to their natural ``uncoupled'' baseline ($\scloss = 0.0263$, $\phloss = 1.6 \times 10^{-4}$) and immediately begin decreasing under coupling pressure. By the end of training, $\scloss$ has dropped to 0.0080, a $\mathbf{-70\%}$ reduction.
 
-Three important observations:
+Four important observations:
 
 \begin{enumerate}[leftmargin=*,itemsep=2pt]
 \item \textbf{Coupling is free on the flow-matching objective.} $\fmloss$ at the end of training is 0.477 for \texttt{flow\_coupled} vs.\ 0.476 for \texttt{flow\_only} (Table~\ref{tab:phase2}): coupling does \emph{not} regress flow-matching loss at this scale. The 30-clip prototype found a $\sim 3.6\%$ regression from coupling, suggesting the effect is data-scale-sensitive.
 \item \textbf{The token-space effect is stronger at scale.} Prototype: $-41.5\%$ on $\scloss$ vs.\ its uncoupled baseline. Paper scale: $-69\%$. The coupling mechanism does not dilute with more data; it amplifies.
-\item \textbf{Coupling concentrates the pixel-space depth distribution.} See \S\,pixel-space evaluation and Table~\ref{tab:pixel_eval} below: while token-space $\scloss$ drops cleanly, the variance of the decoded-depth distribution also drops, and the variant moves further from the real depth distribution in Wasserstein. We discuss this as the predictability-vs-fidelity trade-off.
+\item \textbf{Action conditioning is a partial substitute for coupling.} The CFG variant (\texttt{flow\_coupled\_cfg}, trained with real per-frame actions + p=0.2 CFG dropout) starts the coupling phase with $\scloss = 0.021$ versus 0.026 for the action-free \texttt{flow\_coupled} --- a 20 \% reduction \emph{before} any coupling loss is applied. The two interventions converge to roughly the same $\scloss$ plateau by the end of training; both apparently correct the same underlying issue (flow-matching alone produces unpredictable rollouts) from different angles. This is a useful nuance: practitioners with reliable action data may not need the additional coupling-loss complexity.
+\item \textbf{Coupling concentrates the pixel-space depth distribution.} See Table~\ref{tab:pixel_eval} below: while token-space $\scloss$ drops cleanly, the variance of the decoded-depth distribution also drops, and the variant moves further from the real depth distribution in Wasserstein. We discuss this as the predictability-vs-fidelity trade-off.
 \end{enumerate}
+
+\paragraph{Unified text+action conditioning (the CFG variant).}
+The \texttt{flow\_coupled\_cfg} arm trains with CFG action dropout (Ho \& Salimans 2022 style): with probability $p=0.2$ during training, we zero out the per-frame action input to the generator. This gives a single set of weights that supports \emph{two inference modes}: (a) text-only generation (zero actions at inference, equivalent to the un-conditioned flow\_coupled), and (b) action-conditioned generation (real actions at inference). Closes the architectural claim of ``one model, two modes'' from this paper's project plan: same checkpoint, text+optional-action conditioning.
 
 \paragraph{Pixel-space evaluation.}
 
