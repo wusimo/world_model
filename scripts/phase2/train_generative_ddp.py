@@ -259,7 +259,10 @@ def main() -> None:
         max_batches = 3
         train_sample_steps = 4
     else:
-        max_batches = 10**9
+        # Bound per-epoch iterations so streaming dataloader doesn't yield forever
+        # (otherwise ep never advances and the warmup_epochs-based coupling gate
+        # never activates).
+        max_batches = steps_per_epoch * grad_accum
 
     # ---- W&B
     wandb_run = None
@@ -354,7 +357,12 @@ def main() -> None:
                     )
 
         # ---- per-epoch val (rank 0)
-        if _is_main(rank):
+        # Skip val if it would invoke a DDP-wrapped forward from rank 0 alone
+        # (other ranks idle at dist.barrier below) — that hangs NCCL.
+        # The val_ids.json schema bug (clip_id strings vs episode_index ints) means
+        # val_ds is typically size 0–1; not worth the hang. Skip when too small.
+        val_too_small = (not hasattr(val_ds, "__len__")) or len(val_ds) < 5
+        if _is_main(rank) and not val_too_small:
             gen.eval()
             if phys is not None:
                 phys.eval()

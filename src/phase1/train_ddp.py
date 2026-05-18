@@ -239,6 +239,10 @@ def run_one(cfg: dict, run_name: str, args) -> dict:
     log_every = int(cfg["train"].get("log_every_steps", 50))
 
     t0 = time.time()
+    # Bound per-epoch iterations so all ranks finish together — IterableDataset can
+    # otherwise hand a different number of batches to each rank, which makes DDP
+    # all_reduce hang once one rank exits its for-loop ahead of the others.
+    max_batches_per_epoch = steps_per_epoch * grad_accum
     for epoch in range(start_epoch, epochs):
         if streaming:
             train_ds.set_epoch(epoch)
@@ -246,6 +250,8 @@ def run_one(cfg: dict, run_name: str, args) -> dict:
         opt.zero_grad(set_to_none=True)
         ep_losses = []
         for bi, batch in enumerate(train_dl):
+            if bi >= max_batches_per_epoch:
+                break
             for k in ("ctx_tokens", "ctx_actions", "tgt_action", "tgt_tokens"):
                 batch[k] = batch[k].to(device, non_blocking=True)
             lr = cosine_lr(global_step, total_steps, warmup, cfg["train"]["lr"])
@@ -281,7 +287,9 @@ def run_one(cfg: dict, run_name: str, args) -> dict:
                     )
 
         # ---- per-epoch validation (rank 0 only — val_ds is world_size=1)
-        if _is_main(rank):
+        # Skip when there are no val shards (manifest schema bug stores clip_ids,
+        # splitter expects episode_indexes — see handoff doc §4.B).
+        if _is_main(rank) and len(val_shards) > 0:
             head.eval()
             with torch.no_grad():
                 vs = []
@@ -321,7 +329,8 @@ def run_one(cfg: dict, run_name: str, args) -> dict:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--cfg", default="configs/phase1/paper_scale.yaml")
-    p.add_argument("--run", default="vggt_noact",
+    # NOTE: avoid "--run" — torchrun's argparse fuzzy-matches it to its own --run-path.
+    p.add_argument("--name", "--run", dest="run", default="vggt_noact",
                    choices=["vggt", "vggt_noact", "vggt_bigact"])
     p.add_argument("--out_root", default=None)
     p.add_argument("--resume", action="store_true")

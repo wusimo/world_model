@@ -6,7 +6,7 @@
 seed: 1337
 
 data:
-  cache_dir: results/phase1_scale/cache_tokens         # paper-scale tokens
+  cache_dir: /root/autodl-tmp/cache/paper_scale        # actual paper-scale token cache
   manifest: data/manifests/paper_scale.json
   val_episode_ids_file: data/manifests/val_ids.json
   seq_len: 8
@@ -40,14 +40,14 @@ physics:
   phi_dim: 128                                         # default; sweep {64,128,256} via override
 
 coupling:
-  context_len: 8                                       # matches paper-scale predictor
+  context_len: 4                                       # < generator seq_len=8 so SC rollout has space
   w_selfconsistency: 1.0                               # post-warmup
   w_physics: 0.1                                       # post-warmup
   warmup_epochs: 6                                     # ~50% of 12 epochs (sched coupling)
 
 predictor_ckpt:
   # Trained by scripts/phase1/train_ddp.py with configs/phase1/paper_scale.yaml.
-  path: results/phase1_scale/runs/vggt_noact/best.pt
+  path: /root/autodl-tmp/results/phase1_ddp/vggt_noact/ckpt_step_00014000.pt
   token_dim: 2048
   action_dim: 7
   hidden_dim: 1024
@@ -86,7 +86,7 @@ eval:
 
 ddp:
   backend: nccl
-  find_unused_parameters: false
+  find_unused_parameters: true   # generator+physics have variant-conditional grads (L_sc, L_ph weights)
 
 wandb:
   enabled: false
