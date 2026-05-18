@@ -1,0 +1,95 @@
+# Phase 2 — CFG action-conditioned generator (closes ONE_PAGER §7 Q1).
+# Same architecture as paper_scale.yaml but with action_dim>0 and CFG dropout.
+seed: 1337
+
+data:
+  cache_dir: /root/autodl-tmp/cache/paper_scale
+  manifest: data/manifests/paper_scale.json
+  val_episode_ids: [3, 9, 14, 19, 24, 29]   # tiny set, val is skipped at this size anyway
+  extracted_root: /root/autodl-tmp/oxe_extracted
+  seq_len: 8
+  stride: 4
+  empty_task_placeholder: "robot manipulation task"
+  streaming: true
+
+text_encoder:
+  hf_id: openai/clip-vit-large-patch14
+  max_length: 64
+  output_dim: 768
+
+generator:
+  token_dim: 2048
+  token_grid: 8
+  seq_len: 8
+  cond_text_dim: 768
+  hidden_dim: 1280
+  n_layers: 20
+  n_heads: 16
+  dropout: 0.0
+  use_checkpoint: true
+  action_dim: 14            # unified slot vector (matches scripts/extract_oxe_actions.py)
+  action_embed_dim: 128
+
+physics:
+  token_dim: 2048
+  token_grid: 8
+  context_len: 4
+  hidden_dim: 768
+  n_layers: 6
+  n_heads: 12
+  phi_dim: 128
+
+coupling:
+  context_len: 4
+  w_selfconsistency: 1.0
+  w_physics: 0.1
+  warmup_epochs: 6
+
+predictor_ckpt:
+  path: /root/autodl-tmp/results/phase1_ddp/vggt_noact/ckpt_step_00014000.pt
+  token_dim: 2048
+  action_dim: 7
+  hidden_dim: 1024
+  n_layers: 12
+  n_heads: 16
+  action_embed_dim: 256
+  context_len: 8
+  dropout: 0.1
+  use_actions: false
+  use_checkpoint: false
+
+train:
+  batch_size: 16
+  grad_accum: 2
+  epochs: 12
+  lr: 1.5e-4
+  weight_decay: 0.05
+  warmup_steps: 2000
+  grad_clip: 1.0
+  num_workers: 4
+  device: cuda
+  amp_dtype: bfloat16
+  ckpt_every_steps: 1000
+  log_every_steps: 50
+  val_every_steps: 2000
+  ema_decay: 0.999
+  train_sample_steps: 8
+  action_cfg_dropout_p: 0.2    # CFG: zero actions with this prob during training
+
+variants:
+  flow_only:    { w_selfconsistency: 0.0, w_physics: 0.0 }
+  flow_coupled: { w_selfconsistency: 1.0, w_physics: 0.1 }
+
+eval:
+  sample_steps: 24
+  n_eval_windows: 256
+
+ddp:
+  backend: nccl
+  find_unused_parameters: true
+
+wandb:
+  enabled: false
+  project: geophys-wm
+  entity: null
+  run_name: phase2-paper-scale-cfg

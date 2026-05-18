@@ -122,6 +122,7 @@ def load_predictor(cfg: dict, device: torch.device) -> PredictiveHead:
 def sample_with_grad(
     gen: FlowMatchingGenerator | DDP,
     cond_text: torch.Tensor, init_frame: torch.Tensor, n_steps: int,
+    actions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Eulerian rollout that retains gradients (for L_sc / L_ph)."""
     base = gen.module if isinstance(gen, DDP) else gen
@@ -132,7 +133,7 @@ def sample_with_grad(
     dt = 1.0 / n_steps
     for i in range(n_steps):
         t = torch.full((B,), i * dt, device=device)
-        v = gen(z, t, cond_text, init_frame)
+        v = gen(z, t, cond_text, init_frame, actions=actions)
         z = z + dt * v
     return z
 
@@ -302,13 +303,22 @@ def main() -> None:
             z = batch["z"].to(device, non_blocking=True)
             init = batch["init"].to(device, non_blocking=True)
             cond = text_enc(batch["text"], device)
+            # CFG action dropout: with probability action_cfg_dropout_p, zero
+            # out the action input so the same model can be sampled in either
+            # text-only mode (zeros at inference) or action-conditioned mode.
+            actions = batch.get("actions")
+            if actions is not None:
+                actions = actions.to(device, non_blocking=True)
+                p_drop = float(cfg["train"].get("action_cfg_dropout_p", 0.0))
+                if p_drop > 0 and torch.rand((), device=device).item() < p_drop:
+                    actions = torch.zeros_like(actions)
 
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
-                fm = flow_matching_loss(gen, z, cond, init)
+                fm = flow_matching_loss(gen, z, cond, init, actions=actions)
                 total = fm
                 sc_val = ph_val = torch.zeros((), device=device)
                 if do_coupling and active:
-                    z_gen = sample_with_grad(gen, cond, init, n_steps=train_sample_steps)
+                    z_gen = sample_with_grad(gen, cond, init, n_steps=train_sample_steps, actions=actions)
                     base_phys = phys.module if isinstance(phys, DDP) else phys
                     phys_C = base_phys.cfg.context_len
                     sc_val = predictor_selfconsistency_loss(

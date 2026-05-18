@@ -299,7 +299,7 @@ def main():
     # --------------- decoder training data
     shards = discover_shards(cfg["data"]["cache_dir"])
     val_eps = set(cfg["data"]["val_episode_ids"])
-    train_sh = [s for s in shards if s.episode_index not in val_eps]
+    train_sh = [s for s in shards if s.episode_index not in val_eps][:300]  # paper-scale subset: 300 shards is plenty for a tiny decoder
     val_sh = [s for s in shards if s.episode_index in val_eps]
     print(f"shards: train {len(train_sh)}  val {len(val_sh)}")
     train_ds = FrameTokenDepth(train_sh)

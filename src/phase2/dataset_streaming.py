@@ -43,6 +43,8 @@ class StreamingGenerativeWindows(IterableDataset):
         rank: int = 0,
         world_size: int = 1,
         seed: int = 0,
+        extracted_root: str | Path | None = None,
+        action_dim: int = 0,
     ):
         self.all_shards = list(shards)
         self.T = int(seq_len)
@@ -53,6 +55,9 @@ class StreamingGenerativeWindows(IterableDataset):
         self.world_size = max(1, int(world_size))
         self.seed = int(seed)
         self.epoch = 0
+        # Optional: load per-frame actions from extracted dir if action_dim > 0.
+        self.extracted_root = Path(extracted_root) if extracted_root else None
+        self.action_dim = int(action_dim)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -71,12 +76,35 @@ class StreamingGenerativeWindows(IterableDataset):
             total += max(0, (sh.n_frames - self.T) // self.stride + 1)
         return max(1, total // self.world_size)
 
+    def _load_actions(self, sh: Shard) -> np.ndarray | None:
+        """Load per-frame action sequence from the extracted dir, or None."""
+        if self.action_dim <= 0 or self.extracted_root is None:
+            return None
+        clip_id = sh.meta.get("clip_id", "")
+        if "_" not in clip_id:
+            return None
+        # clip_id format: "<dataset>_NNNNNN"
+        dataset, _, ep_str = clip_id.rpartition("_")
+        try:
+            ep_idx = int(ep_str)
+        except ValueError:
+            return None
+        actions_path = self.extracted_root / dataset / f"episode_{ep_idx:06d}" / "actions.npy"
+        if not actions_path.exists():
+            return None
+        try:
+            arr = np.load(actions_path).astype(np.float32)
+        except Exception:
+            return None
+        return arr
+
     def _emit(self, sh: Shard, rng: random.Random) -> Iterator[dict]:
         data = np.load(sh.path)
         try:
             tokens = np.asarray(data["tokens"])  # [N, P, D]
         finally:
             data.close()
+        actions_full = self._load_actions(sh)  # [N, A] or None
         N = sh.n_frames
         positions = list(range(0, N - self.T + 1, self.stride))
         rng.shuffle(positions)
@@ -86,13 +114,20 @@ class StreamingGenerativeWindows(IterableDataset):
             task = self.empty
         for t0 in positions:
             z = _load_tokens(tokens[t0:t0 + self.T])  # [T, P, D] fp32
-            yield {
+            item = {
                 "z": z,
                 "init": z[0],
                 "text": task,
                 "shard_idx": torch.tensor(0, dtype=torch.long),
                 "t0": torch.tensor(t0, dtype=torch.long),
             }
+            if self.action_dim > 0:
+                if actions_full is not None and t0 + self.T <= len(actions_full):
+                    a_slice = actions_full[t0:t0 + self.T]
+                else:
+                    a_slice = np.zeros((self.T, self.action_dim), dtype=np.float32)
+                item["actions"] = torch.from_numpy(a_slice).float()
+            yield item
 
     def __iter__(self) -> Iterator[dict]:
         wi = get_worker_info()
@@ -117,10 +152,14 @@ def build_streaming_datasets(
     T = cfg["data"]["seq_len"]; S = cfg["data"]["stride"]
     ph = cfg["data"]["empty_task_placeholder"]
     seed = int(cfg.get("seed", 0))
+    extracted_root = cfg["data"].get("extracted_root", None)
+    action_dim = int(cfg.get("generator", {}).get("action_dim", 0))
+    common_kwargs = dict(
+        seq_len=T, stride=S, task_by_ep=tasks, empty_placeholder=ph, seed=seed,
+        extracted_root=extracted_root, action_dim=action_dim,
+    )
     return (
-        StreamingGenerativeWindows(train_sh, T, S, tasks, ph,
-                                   rank=rank, world_size=world_size, seed=seed),
+        StreamingGenerativeWindows(train_sh, rank=rank, world_size=world_size, **common_kwargs),
         # Validation runs on rank 0 only (full set), so world_size=1 there.
-        StreamingGenerativeWindows(val_sh, T, S, tasks, ph,
-                                   rank=0, world_size=1, seed=seed),
+        StreamingGenerativeWindows(val_sh, rank=0, world_size=1, **common_kwargs),
     )

@@ -35,6 +35,12 @@ class GenerativeConfig:
     n_heads: int = 12
     dropout: float = 0.0
     use_checkpoint: bool = False    # activation checkpointing on backbone
+    # Action conditioning (set action_dim > 0 to enable). Trained with
+    # classifier-free dropout on actions, so the same checkpoint can be sampled
+    # in either text-only mode (zero actions at inference) or action-conditioned
+    # mode (real actions). Per ONE_PAGER north-star.
+    action_dim: int = 0
+    action_embed_dim: int = 128
 
 
 class TimeEmbed(nn.Module):
@@ -64,6 +70,16 @@ class FlowMatchingGenerator(nn.Module):
         self.in_proj = nn.Linear(cfg.token_dim, cfg.hidden_dim)
         self.out_proj = nn.Linear(cfg.hidden_dim, cfg.token_dim)
         self.time_embed = TimeEmbed(cfg.hidden_dim)
+        # Optional per-frame action conditioning. action_proj maps the 14-d unified
+        # action vector to hidden_dim and is added per-frame onto every token.
+        if cfg.action_dim > 0:
+            self.action_proj = nn.Sequential(
+                nn.Linear(cfg.action_dim, cfg.action_embed_dim),
+                nn.GELU(),
+                nn.Linear(cfg.action_embed_dim, cfg.hidden_dim),
+            )
+        else:
+            self.action_proj = None
         self.cond_proj = nn.Linear(cfg.cond_text_dim, cfg.hidden_dim)
         self.init_proj = nn.Linear(cfg.token_dim, cfg.hidden_dim)
 
@@ -86,6 +102,7 @@ class FlowMatchingGenerator(nn.Module):
         t: torch.Tensor,            # [B]
         cond_text: torch.Tensor,    # [B, cond_text_dim]
         init_frame: torch.Tensor,   # [B, P, D]
+        actions: torch.Tensor | None = None,  # [B, T, A] or None (= text-only mode)
     ) -> torch.Tensor:
         B, T, P, D = z_t.shape
         x = self.in_proj(z_t.reshape(B, T * P, D))
@@ -96,6 +113,12 @@ class FlowMatchingGenerator(nn.Module):
         # broadcast init tokens to frames (share across T so they act as a
         # "static reference" that the generator has to deform).
         x = x + init_tok.repeat(1, T, 1)
+        # Per-frame action conditioning (CFG-trained: at inference, pass zeros
+        # for text-only mode or real actions for action-conditioned mode).
+        if self.action_proj is not None and actions is not None:
+            a_emb = self.action_proj(actions)              # [B, T, H]
+            a_per_token = a_emb.unsqueeze(2).expand(-1, -1, P, -1)  # [B, T, P, H]
+            x = x + a_per_token.reshape(B, T * P, -1)
         x = x + self.pos[:, : x.size(1)]
         if self.cfg.use_checkpoint and self.training:
             from torch.utils.checkpoint import checkpoint
@@ -111,8 +134,14 @@ class FlowMatchingGenerator(nn.Module):
         return v
 
     @torch.no_grad()
-    def sample(self, cond_text, init_frame, n_steps: int = 24) -> torch.Tensor:
-        """Euler integrator for the flow ODE. Returns tokens at t=1."""
+    def sample(self, cond_text, init_frame, n_steps: int = 24,
+               actions: torch.Tensor | None = None) -> torch.Tensor:
+        """Euler integrator for the flow ODE. Returns tokens at t=1.
+
+        Pass actions=None (or an all-zero tensor) for text-only mode; pass real
+        per-frame actions [B, T, A] for action-conditioned mode. The same
+        checkpoint supports both modes thanks to CFG dropout at train time.
+        """
         B = cond_text.size(0)
         device = cond_text.device
         T, P, D = self.cfg.seq_len, self.P, self.cfg.token_dim
@@ -120,7 +149,7 @@ class FlowMatchingGenerator(nn.Module):
         dt = 1.0 / n_steps
         for i in range(n_steps):
             t = torch.full((B,), i * dt, device=device)
-            v = self(z, t, cond_text, init_frame)
+            v = self(z, t, cond_text, init_frame, actions=actions)
             z = z + dt * v
         return z
 
@@ -130,11 +159,12 @@ def flow_matching_loss(
     z1: torch.Tensor,            # [B, T, P, D] real tokens
     cond_text: torch.Tensor,
     init_frame: torch.Tensor,
+    actions: torch.Tensor | None = None,  # [B, T, A] or None
 ) -> torch.Tensor:
     B = z1.size(0)
     t = torch.rand(B, device=z1.device)
     z0 = torch.randn_like(z1)
     zt = (1 - t)[:, None, None, None] * z0 + t[:, None, None, None] * z1
     target = z1 - z0
-    pred = model(zt, t, cond_text, init_frame)
+    pred = model(zt, t, cond_text, init_frame, actions=actions)
     return (pred - target).pow(2).mean()

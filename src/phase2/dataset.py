@@ -82,6 +82,10 @@ def collate(batch: list[dict]) -> dict:
         "shard_idx": torch.stack([b["shard_idx"] for b in batch]),
         "t0": torch.stack([b["t0"] for b in batch]),
     }
+    # Pass through optional per-frame actions (only present when the streaming
+    # dataset was built with action_dim > 0).
+    if "actions" in batch[0]:
+        out["actions"] = torch.stack([b["actions"] for b in batch])
     return out
 
 

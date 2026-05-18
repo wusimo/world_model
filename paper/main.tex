@@ -214,30 +214,67 @@ We train two Phase 2 arms with identical architecture, data, and seed, differing
 
 \begin{table}[t]
 \centering
-\caption{\textbf{Phase 2 coupling comparison.} Final losses (lower is better). Paper-scale column: this work.}
+\caption{\textbf{Phase 2 coupling comparison.} Final losses (lower is better) at end of 12-epoch training. The same architecture, dataset, optimizer schedule, and seed; only the coupling weights differ.}
 \label{tab:phase2}
 \begin{tabular}{lcccc}
 \toprule
-Arm & final $\fmloss$ & final $\scloss$ & final $\phloss$ & $\Delta \scloss$ vs.\ baseline \\
+Arm & final $\fmloss$ & final $\scloss$ & final $\phloss$ & $\Delta \scloss$ vs.\ flow\_only \\
 \midrule
-\texttt{flow\_only} (paper-scale) & \TODO{fill} & \TODO{fill} & --- & --- \\
-\textbf{\texttt{flow\_coupled}} (paper-scale, this paper) & \textbf{0.477} & \textbf{0.0080} & $4.9 \times 10^{-7}$ & \textbf{$-70\%$} \\
+\texttt{flow\_only} (paper-scale, baseline) & 0.476 & 0.026 & --- & --- \\
+\textbf{\texttt{flow\_coupled}} (paper-scale, this paper) & \textbf{0.477} & \textbf{0.008} & $4.9 \times 10^{-7}$ & \textbf{$-69\%$} \\
 \midrule
-\texttt{flow\_coupled} (30-clip prototype) & 0.986 & 0.0229 & $1.3 \times 10^{-6}$ & $-41.5\%$ \\
+\texttt{flow\_coupled} (30-clip prototype) & 0.986 & 0.023 & $1.3 \times 10^{-6}$ & $-41.5\%$ vs.\ its baseline \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \textbf{Result.} Figure~\ref{fig:phase2_loss} shows that coupling activates cleanly at step 4\,300. Before activation, $\scloss$ and $\phloss$ are mechanically zero (their weights are zero). At activation, they jump to their natural ``uncoupled'' baseline ($\scloss = 0.0263$, $\phloss = 1.6 \times 10^{-4}$) and immediately begin decreasing under coupling pressure. By the end of training, $\scloss$ has dropped to 0.0080, a $\mathbf{-70\%}$ reduction.
 
-Two important observations:
+Three important observations:
 
 \begin{enumerate}[leftmargin=*,itemsep=2pt]
-\item \textbf{Coupling is free in this experiment.} $\fmloss$ continues to decrease (0.55 $\to$ 0.477) through and past the coupling activation point. The 30-clip prototype found a $\sim 3.6\%$ regression on $\fmloss$ from coupling; at paper scale we see no measurable regression.
-\item \textbf{The effect grows with scale.} Prototype: $-41.5\%$ on $\scloss$. Paper scale: $-70\%$. The mechanism does not dilute with more data; it amplifies.
+\item \textbf{Coupling is free on the flow-matching objective.} $\fmloss$ at the end of training is 0.477 for \texttt{flow\_coupled} vs.\ 0.476 for \texttt{flow\_only} (Table~\ref{tab:phase2}): coupling does \emph{not} regress flow-matching loss at this scale. The 30-clip prototype found a $\sim 3.6\%$ regression from coupling, suggesting the effect is data-scale-sensitive.
+\item \textbf{The token-space effect is stronger at scale.} Prototype: $-41.5\%$ on $\scloss$ vs.\ its uncoupled baseline. Paper scale: $-69\%$. The coupling mechanism does not dilute with more data; it amplifies.
+\item \textbf{Coupling concentrates the pixel-space depth distribution.} See \S\,pixel-space evaluation and Table~\ref{tab:pixel_eval} below: while token-space $\scloss$ drops cleanly, the variance of the decoded-depth distribution also drops, and the variant moves further from the real depth distribution in Wasserstein. We discuss this as the predictability-vs-fidelity trade-off.
 \end{enumerate}
 
-\paragraph{Pixel-space evaluation.} \TODO{Phase 2 outputs decoded via the VGGT depth head provide a qualitative pixel-space comparison between \texttt{flow\_only} and \texttt{flow\_coupled}. This requires the \texttt{flow\_only} run to finish; figure expected in revision.}
+\paragraph{Pixel-space evaluation.}
+
+To check that the token-space improvement transfers to pixel space, we train a small (0.88 M parameter) token$\to$depth decoder on 10\,K cached frames for 5 epochs (val L1 0.125). We sample 8 fixed-seed windows from each variant with the same initial frames, decode them through the trained decoder, and compare against the real cached depth.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.95\linewidth]{figures/pixel_compare_grid.png}
+\caption{\textbf{Decoded depth, $t=0$.} Same initial frame, decoded through the same small decoder for each variant. flow\_coupled outputs are visibly smoother / lower-contrast than flow\_only; this is consistent with the histogram in Fig.~\ref{fig:pixel_hist} and Table~\ref{tab:pixel_eval}.}
+\label{fig:pixel_compare}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\linewidth]{figures/pixel_hist.png}
+\caption{\textbf{Scale-normalized decoded depth histogram} across all 8 samples and 8 frames per sample. flow\_only's distribution tracks the real depth more closely; flow\_coupled's distribution is noticeably tighter around the median (smaller $\sigma$).}
+\label{fig:pixel_hist}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Pixel-space comparison.} Decoded depth statistics over $n=8$ samples × 8 frames per sample × 64×64 spatial. ``Temporal smoothness'' = mean $\ell_1$ between consecutive frames' decoded depth. ``W vs.\ real'' = 1D Wasserstein between the variant's decoded-depth distribution and the real cached depth distribution. Std is the per-pixel standard deviation.}
+\label{tab:pixel_eval}
+\begin{tabular}{lccc}
+\toprule
+Variant & Temporal smoothness $\downarrow$ & $W$ vs.\ real $\downarrow$ & Decoded depth $\sigma$ \\
+\midrule
+real (cache) & 0.006 & --- & 0.173 \\
+\texttt{flow\_only} & 0.040 & \textbf{0.005} & 0.163 \\
+\texttt{flow\_coupled} & 0.041 & 0.036 & 0.107 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{What the pixel-space result tells us.}
+There is no free lunch. While coupling reduces the predictor's self-consistency loss by 69\% in token space (Table~\ref{tab:phase2}), it also \emph{concentrates} the generated depth distribution: flow\_coupled's decoded-depth standard deviation is 38\% lower than real, while flow\_only's is within 6\% of real. Visually (Fig.~\ref{fig:pixel_compare}), flow\_coupled outputs are smoother and lower-contrast.
+
+This is consistent with the interpretation that $\scloss$ acts as a \emph{predictability prior}: it asks the generator to produce sequences that the frozen predictor can extrapolate easily, and easy-to-extrapolate trajectories are smoother in token space. The right operating point therefore depends on the downstream task: predictor-plausibility (where coupling helps) versus distributional fidelity (where coupling slightly hurts). We expect this trade-off to be tunable via the coupling weights $w_{\text{sc}}, w_{\text{ph}}$. \TODO{Run the coupling-weight sweep to characterize the Pareto frontier.}
 
 \paragraph{Coupling-weight sweep.} \TODO{We sweep $w_{\text{sc}} \in \{0.5, 1.0, 2.0\}$ and $w_{\text{ph}} \in \{0, 0.1, 0.5\}$ to characterize the Pareto frontier between $\fmloss$ and $\scloss$. 9 runs, $\sim 27$ GPU-hours total.}
 
