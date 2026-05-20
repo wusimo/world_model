@@ -1,0 +1,72 @@
+# Phase 1 — H100-scale predictor (D_psi)
+# Target: ~1 B trainable params on 32× H100, 100K-clip OXE cache.
+# Architecture: 24 layers × 2048 hidden × 16 heads → ~840 M params (token_proj+out_proj+pos+attn+ff).
+# Plus action embedding (when use_actions=true). vggt_noact arm uses zeros.
+seed: 1337
+
+cache:
+  manifest: data/manifests/h100_scale.json
+  use_actions: false                                # NullActions for vggt_noact arm
+  droid_parquet: /data/world_model_workspace/world_model/data/raw/droid_100/data/chunk-000/file-000.parquet
+  out_dir: /shared/cache/h100_scale                 # NFS-backed shared cache from h100-1
+  window: 8
+  stride: 4
+  max_frames_per_clip: 64                           # was 128; matches 30-frame avg
+  token_grid: 8
+  token_dim: 2048
+  save_depth_hw: 64
+  dtype: bfloat16
+
+dataset:
+  split:
+    val_episode_ids_file: data/manifests/h100_val_ids.json
+  normalize_actions: true
+  action_dim: 14                                    # 14-d unified slot vector (per scripts/extract_oxe_actions.py)
+  state_dim: 14
+  streaming: true
+
+head:
+  # 1B params: 24 × 2048 × 16 heads (~14.6M params per Transformer layer × 24 + projections + pos ≈ 850 M)
+  # action_embed_dim 256, dropout 0.1 → final ~1 B
+  hidden_dim: 2048                                  # was 1024
+  n_layers: 24                                      # was 12
+  n_heads: 16
+  dropout: 0.1
+  action_embed_dim: 256
+  context_len: 8
+  token_pool: mean
+  use_checkpoint: true
+
+loss:
+  type: mse
+
+train:
+  # Per-rank batch. 32 ranks × 32 batch × 1 grad_accum = 1024 effective.
+  batch_windows: 32
+  grad_accum: 1
+  epochs: 12
+  lr: 3.0e-4
+  weight_decay: 0.05
+  warmup_steps: 3000
+  grad_clip: 1.0
+  num_workers: 4
+  device: cuda
+  amp_dtype: bfloat16
+  ckpt_every_steps: 2000
+  log_every_steps: 50
+  val_every_steps: 4000
+  ema_decay: 0.999
+
+eval:
+  horizons: [1, 2, 4, 8, 16, 32]
+  bootstrap_iters: 1000
+
+ddp:
+  backend: nccl
+  find_unused_parameters: true
+
+wandb:
+  enabled: false
+  project: geophys-wm
+  entity: null
+  run_name: phase1-h100

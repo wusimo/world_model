@@ -1,0 +1,57 @@
+# Phase 3 — Action policy pi_phi (Stage 1: behavior cloning)
+# A 200-300M Transformer on shared VGGT substrate that maps
+#     (8 frames of pooled VGGT tokens, CLIP-L text embedding) -> 8 future actions
+# Per docs/VLA_FOLLOWUP_PLAN.md Stage 1.
+seed: 1337
+
+data:
+  cache_dir: /shared/cache/h100_scale
+  manifest: data/manifests/h100_scale.json
+  val_episode_ids_file: data/manifests/h100_val_ids.json
+  extracted_root: /shared/oxe_extracted
+  seq_len: 8                                        # 8 ctx frames, predict 8 ctx actions
+  stride: 4
+  empty_task_placeholder: "robot manipulation task"
+  streaming: true
+
+text_encoder:
+  hf_id: openai/clip-vit-large-patch14
+  max_length: 64
+  output_dim: 768
+
+policy:
+  token_dim: 2048
+  token_grid: 8
+  seq_len: 8
+  cond_text_dim: 768
+  hidden_dim: 1280
+  n_layers: 12
+  n_heads: 16
+  dropout: 0.1
+  use_checkpoint: false
+  action_dim: 14
+  # Output: per-step actions. Optionally discretize for cross-entropy loss.
+  discretize_bins: 0                                # 0 = continuous MSE loss; >0 enables CE on bins
+
+train:
+  batch_size: 16                                    # per rank; head is small
+  grad_accum: 2
+  epochs: 12
+  lr: 3.0e-4
+  weight_decay: 0.05
+  warmup_steps: 1000
+  grad_clip: 1.0
+  num_workers: 4
+  device: cuda
+  amp_dtype: bfloat16
+  ckpt_every_steps: 1000
+  log_every_steps: 50
+  val_every_steps: 2000
+  # Stage 2 (self-supervised coupling) is enabled here by setting w_world>0.
+  # The coupling loss compares pi(s,l)'s action -> generator outcome -> predictor forecast match.
+  w_bc: 1.0
+  w_world: 0.0                                      # set in stage 2
+
+ddp:
+  backend: nccl
+  find_unused_parameters: false
